@@ -1,100 +1,123 @@
+# app/main.py
+
 import secrets
 
-import httpx
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-)
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
 
-from app.api.employees import (
-    router as employees_router,
-)
-from app.database import get_db
-from app.services.employee_sync import (
-    sync_orangehrm_employees,
-)
+from app.database import SessionLocal
+
 from app.services.orangehrm import (
     build_authorization_url,
     exchange_authorization_code,
-    get_employee_job_details,
     get_employees,
 )
 
+from app.services.employee_sync import (
+    sync_orangehrm_employees,
+)
+
+
+# ============================================================
+# FastAPI Application
+# ============================================================
 
 app = FastAPI(
     title="Enterprise IAM Platform",
     description=(
-        "Identity lifecycle orchestration "
-        "and access management platform"
+        "Enterprise Identity and Access Management platform "
+        "integrating OrangeHRM with IAM lifecycle automation."
     ),
-    version="2.0.0",
+    version="1.0.0",
 )
 
 
-app.include_router(employees_router)
+# ============================================================
+# TEMPORARY OAUTH STORAGE
+# ============================================================
+#
+# LAB VERSION:
+# OAuth state and access token are stored in the Uvicorn
+# process memory.
+#
+# IMPORTANT:
+# Restarting/reloading Uvicorn will clear these values.
+#
+# FUTURE / PRODUCTION:
+# Replace this with persistent database or Redis storage.
+#
+# ============================================================
+
+oauth_state: str | None = None
+oauth_token: str | None = None
 
 
-oauth_state = None
-
-
-orangehrm_token = {
-    "access_token": None,
-    "token_type": None,
-    "expires_in": None,
-}
-
+# ============================================================
+# Root / Health Check
+# ============================================================
 
 @app.get("/")
-def home():
+def root():
+    """
+    Basic health check for the IAM platform.
+    """
+
     return {
         "application": "Enterprise IAM Platform",
-        "server": "APP01",
-        "status": "online",
-        "version": "2.0",
+        "version": "1.0.0",
+        "status": "running",
     }
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "server": "APP01",
-    }
-
+# ============================================================
+# OrangeHRM OAuth Login
+# ============================================================
 
 @app.get("/oauth/login")
-def orangehrm_login():
+def oauth_login():
     """
-    Start the OrangeHRM OAuth2 authorization flow.
+    Start the OrangeHRM OAuth2 Authorization Code flow.
     """
 
     global oauth_state
 
+    # Generate a random state value.
     oauth_state = secrets.token_urlsafe(32)
 
+    # Build OrangeHRM authorization URL.
     authorization_url = build_authorization_url(
         oauth_state
     )
 
+    # Redirect browser to OrangeHRM.
     return RedirectResponse(
-        authorization_url
+        url=authorization_url
     )
 
 
+# ============================================================
+# OrangeHRM OAuth Callback
+# ============================================================
+
 @app.get("/oauth/callback")
-def orangehrm_callback(
+def oauth_callback(
     code: str,
-    state: str,
+    state: str | None = None,
 ):
     """
-    Receive the OrangeHRM authorization code
+    Receive the authorization code from OrangeHRM
     and exchange it for an OAuth access token.
     """
 
-    if state != oauth_state:
+    global oauth_state
+    global oauth_token
+
+    # --------------------------------------------------------
+    # Validate OAuth state
+    # --------------------------------------------------------
+
+    if state and oauth_state and state != oauth_state:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid OAuth state",
@@ -102,173 +125,203 @@ def orangehrm_callback(
 
     try:
 
-        token_response = (
-            exchange_authorization_code(code)
+        # ----------------------------------------------------
+        # Exchange authorization code for token
+        # ----------------------------------------------------
+
+        token_response = exchange_authorization_code(
+            code
         )
 
-    except httpx.HTTPStatusError as exc:
+        # ----------------------------------------------------
+        # Extract access token
+        # ----------------------------------------------------
+
+        access_token = token_response.get(
+            "access_token"
+        )
+
+        if not access_token:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "OrangeHRM token response did not "
+                    "contain an access_token."
+                ),
+            )
+
+        # ----------------------------------------------------
+        # Store token in FastAPI/Uvicorn process memory
+        # ----------------------------------------------------
+
+        oauth_token = access_token
+
+        # Authorization code has been consumed.
+        oauth_state = None
+
+        # ----------------------------------------------------
+        # Return safe response
+        #
+        # DO NOT expose the actual token in the browser.
+        # ----------------------------------------------------
+
+        return {
+            "message": (
+                "OAuth authentication completed successfully"
+            ),
+            "token_received": True,
+            "token_type": token_response.get(
+                "token_type"
+            ),
+            "expires_in": token_response.get(
+                "expires_in"
+            ),
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
 
         raise HTTPException(
-            status_code=502,
-            detail=exc.response.text,
+            status_code=500,
+            detail=str(exc),
         )
 
-    orangehrm_token["access_token"] = (
-        token_response.get("access_token")
-    )
 
-    orangehrm_token["token_type"] = (
-        token_response.get("token_type")
-    )
+# ============================================================
+# OAuth Status
+# ============================================================
 
-    orangehrm_token["expires_in"] = (
-        token_response.get("expires_in")
-    )
+@app.get("/oauth/status")
+def oauth_status():
+    """
+    Check whether this FastAPI process currently
+    has an OrangeHRM OAuth access token.
+    """
 
     return {
-        "status": "OrangeHRM OAuth successful",
-        "token_type": (
-            orangehrm_token["token_type"]
-        ),
-        "expires_in": (
-            orangehrm_token["expires_in"]
-        ),
-        "access_token_received": bool(
-            orangehrm_token["access_token"]
-        ),
+        "token_available": oauth_token is not None
     }
 
 
-@app.get("/integrations/orangehrm/status")
-def orangehrm_status():
-    """
-    Show the current OrangeHRM integration status
-    without exposing the access token.
-    """
+# ============================================================
+# OrangeHRM Employee API Test
+# ============================================================
 
-    return {
-        "integration": "OrangeHRM",
-        "authenticated": bool(
-            orangehrm_token["access_token"]
-        ),
-        "token_type": (
-            orangehrm_token["token_type"]
-        ),
-        "expires_in": (
-            orangehrm_token["expires_in"]
-        ),
-    }
-
-
-@app.get("/integrations/orangehrm/employees")
-def orangehrm_employees():
+@app.get("/employees")
+def employees():
     """
-    Retrieve basic employee records directly
-    from OrangeHRM.
+    Retrieve employees directly from OrangeHRM.
+
+    This endpoint verifies:
+        FastAPI
+            ->
+        OAuth Token
+            ->
+        OrangeHRM API
     """
 
-    access_token = (
-        orangehrm_token["access_token"]
-    )
+    global oauth_token
 
-    if not access_token:
+    if not oauth_token:
 
         raise HTTPException(
             status_code=401,
             detail=(
-                "OrangeHRM is not authenticated. "
-                "Open /oauth/login first."
+                "No OAuth token available. "
+                "Authenticate through /oauth/login first."
             ),
         )
 
     try:
 
-        return get_employees(
-            access_token
+        result = get_employees(
+            oauth_token
         )
 
-    except httpx.HTTPStatusError as exc:
+        return result
+
+    except Exception as exc:
 
         raise HTTPException(
-            status_code=502,
-            detail=exc.response.text,
+            status_code=500,
+            detail=str(exc),
         )
 
 
-@app.get(
-    "/integrations/orangehrm/employees/"
-    "{emp_number}/job-details"
-)
-def orangehrm_employee_job_details(
-    emp_number: int,
-):
+# ============================================================
+# OrangeHRM -> IAM Database Employee Synchronization
+# ============================================================
+
+@app.post("/sync/employees")
+def sync_employees():
     """
-    Retrieve job details for a specific OrangeHRM
-    employee using the OrangeHRM empNumber.
+    Synchronize OrangeHRM employees into the IAM database.
+
+    Flow:
+
+        OrangeHRM
+            |
+            | OAuth2
+            v
+        Enterprise IAM Platform
+            |
+            | employee_sync.py
+            v
+        IAM Database
     """
 
-    access_token = (
-        orangehrm_token["access_token"]
-    )
+    global oauth_token
 
-    if not access_token:
+    # --------------------------------------------------------
+    # Verify OAuth authentication
+    # --------------------------------------------------------
+
+    if not oauth_token:
 
         raise HTTPException(
             status_code=401,
             detail=(
-                "OrangeHRM is not authenticated. "
-                "Open /oauth/login first."
+                "No OrangeHRM OAuth token available. "
+                "Authenticate through /oauth/login first."
             ),
         )
 
-    try:
+    # --------------------------------------------------------
+    # Create IAM database session
+    # --------------------------------------------------------
 
-        return get_employee_job_details(
-            access_token,
-            emp_number,
-        )
-
-    except httpx.HTTPStatusError as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail=exc.response.text,
-        )
-
-
-@app.post("/integrations/orangehrm/sync")
-def orangehrm_sync(
-    db: Session = Depends(get_db),
-):
-    """
-    Synchronize OrangeHRM employees into
-    the IAM PostgreSQL database.
-    """
-
-    access_token = (
-        orangehrm_token["access_token"]
-    )
-
-    if not access_token:
-
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                "OrangeHRM is not authenticated. "
-                "Open /oauth/login first."
-            ),
-        )
+    db = SessionLocal()
 
     try:
 
-        return sync_orangehrm_employees(
-            access_token,
-            db,
+        # ----------------------------------------------------
+        # Synchronize employees
+        # ----------------------------------------------------
+
+        result = sync_orangehrm_employees(
+            access_token=oauth_token,
+            db=db,
         )
 
-    except httpx.HTTPStatusError as exc:
+        return result
+
+    except HTTPException:
+
+        db.rollback()
+        raise
+
+    except Exception as exc:
+
+        db.rollback()
 
         raise HTTPException(
-            status_code=502,
-            detail=exc.response.text,
+            status_code=500,
+            detail=str(exc),
         )
+
+    finally:
+
+        db.close()

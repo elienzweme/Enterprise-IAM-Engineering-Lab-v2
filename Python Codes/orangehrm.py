@@ -1,6 +1,6 @@
 import os
-
 import httpx
+
 from dotenv import load_dotenv
 
 
@@ -13,9 +13,10 @@ CLIENT_SECRET = os.getenv("ORANGEHRM_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("ORANGEHRM_REDIRECT_URI")
 
 
+
 def build_authorization_url(state: str) -> str:
     """
-    Build the OrangeHRM OAuth2 authorization URL.
+    Build OrangeHRM OAuth2 authorization URL.
     """
 
     params = {
@@ -30,12 +31,17 @@ def build_authorization_url(state: str) -> str:
     return f"{BASE_URL}/oauth2/authorize?{query}"
 
 
+
 def exchange_authorization_code(code: str) -> dict:
     """
-    Exchange an OAuth authorization code for an access token.
+    Exchange OAuth authorization code
+    for an OrangeHRM access token.
     """
 
-    token_url = f"{BASE_URL}/oauth2/token"
+    token_url = (
+        f"{BASE_URL}/oauth2/token"
+    )
+
 
     data = {
         "grant_type": "authorization_code",
@@ -45,69 +51,120 @@ def exchange_authorization_code(code: str) -> dict:
         "client_secret": CLIENT_SECRET,
     }
 
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+
+
     response = httpx.post(
         token_url,
         data=data,
-        timeout=30.0,
+        headers=headers,
+        timeout=30
     )
+
+
+    print("TOKEN RESPONSE STATUS:")
+    print(response.status_code)
+
+
+    print("TOKEN RESPONSE BODY:")
+    print(response.text)
+
 
     response.raise_for_status()
 
+
     return response.json()
+
 
 
 def get_employees(access_token: str) -> dict:
     """
-    Retrieve the OrangeHRM employee list.
+    Retrieve OrangeHRM employees.
     """
 
+
     employee_url = (
-        f"{BASE_URL}/index.php/api/v2/pim/employees"
+        f"{BASE_URL}/api/v2/pim/employees"
     )
+
 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
+
 
     response = httpx.get(
         employee_url,
         headers=headers,
-        timeout=30.0,
+        timeout=30
     )
 
+
+    print("EMPLOYEE API URL:")
+    print(employee_url)
+
+
+    print("EMPLOYEE API STATUS:")
+    print(response.status_code)
+
+
+    print("EMPLOYEE API RESPONSE:")
+    print(response.text)
+
+
     response.raise_for_status()
+
 
     return response.json()
 
 
+
 def get_employee_job_details(
     access_token: str,
-    emp_number: int,
+    emp_number: int
 ) -> dict:
     """
-    Retrieve job details for one OrangeHRM employee.
-
-    OrangeHRM uses empNumber for this API, which is different
-    from the employeeId field used by the IAM database.
+    Retrieve job details for employee.
     """
 
+
     job_details_url = (
-        f"{BASE_URL}/index.php/api/v2/pim/employees/"
+        f"{BASE_URL}/api/v2/pim/employees/"
         f"{emp_number}/job-details"
     )
+
 
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json",
     }
 
+
     response = httpx.get(
         job_details_url,
         headers=headers,
-        timeout=30.0,
+        timeout=30
     )
 
+
+    print("JOB DETAILS URL:")
+    print(job_details_url)
+
+
+    print("JOB DETAILS STATUS:")
+    print(response.status_code)
+
+
+    print("JOB DETAILS RESPONSE:")
+    print(response.text)
+
+
     response.raise_for_status()
+
 
     return response.json()
