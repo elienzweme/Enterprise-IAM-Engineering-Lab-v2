@@ -11,10 +11,16 @@ from app.config.identity_scope import (
     DEPARTMENT_GROUP_MAPPING
 )
 
+from app.services.hr_sync_scope import (
+    is_hr_managed_user
+)
+
 
 def get_birthright_group(department):
     """
     Returns department RBAC group.
+
+    Birthright groups only.
     Privileged groups are intentionally excluded.
     """
 
@@ -26,33 +32,68 @@ def get_birthright_group(department):
     )
 
 
+def build_identity_record(
+        first_name,
+        last_name,
+        department,
+        job_title,
+        employee_id
+):
+    """
+    Creates IAM identity candidate.
+    """
+
+    return {
+        "employee_id": employee_id,
+        "first_name": first_name,
+        "last_name": last_name,
+        "department": department,
+        "job_title": job_title
+    }
+
+
+
 def sync_orangehrm_employees(
-    access_token: str,
-    db: Session,
-) -> dict:
+        access_token: str,
+        db: Session
+):
 
     """
-    OrangeHRM authoritative employee synchronization.
+    OrangeHRM -> IAM Employee Synchronization
+
+    Source of Truth:
+        OrangeHRM
+
+    Scope:
+        HR Managed identities only
+
+
+    Excluded:
+        Contractors
+        Service Accounts
+        Privileged Accounts
+        Test Accounts
+
 
     Flow:
 
     OrangeHRM
         |
         v
-    IAM Platform Database
+    Identity Scope Validation
         |
         v
-    AD Provisioning Engine
-
-    Controls:
-    - Employee ID matching
-    - HR authoritative source
-    - Department RBAC mapping
-    - Audit logging
+    IAM Database
+        |
+        v
+    AD Joiner Automation
     """
 
 
-    payload = get_employees(access_token)
+    payload = get_employees(
+        access_token
+    )
+
 
     employees = payload.get(
         "data",
@@ -71,57 +112,61 @@ def sync_orangehrm_employees(
     for hr_employee in employees:
 
 
-        employee_id = str(
-            hr_employee.get(
-                "employeeId"
-            ) or ""
-        ).strip()
+        try:
+
+
+            employee_id = str(
+                hr_employee.get(
+                    "employeeId"
+                )
+                or ""
+            ).strip()
 
 
 
-        if not employee_id:
-            skipped += 1
-            continue
+            if not employee_id:
+
+                skipped += 1
+                continue
 
 
 
-        first_name = (
-            hr_employee.get(
-                "firstName"
+            first_name = (
+                hr_employee.get(
+                    "firstName"
+                )
+                or ""
+            ).strip()
+
+
+
+            last_name = (
+                hr_employee.get(
+                    "lastName"
+                )
+                or ""
+            ).strip()
+
+
+
+            emp_number = hr_employee.get(
+                "empNumber"
             )
-            or ""
-        ).strip()
 
 
 
-        last_name = (
-            hr_employee.get(
-                "lastName"
-            )
-            or ""
-        ).strip()
+            department = None
+            job_title = None
+            employment_status = "Active"
 
 
 
-        emp_number = hr_employee.get(
-            "empNumber"
-        )
+            #
+            # Retrieve OrangeHRM job data
+            #
 
+            if emp_number:
 
-
-        department = None
-        job_title = None
-        employment_status = "Active"
-
-
-
-        # ---------------------------------
-        # Pull OrangeHRM job information
-        # ---------------------------------
-
-        if emp_number:
-
-            try:
 
                 job_payload = (
                     get_employee_job_details(
@@ -164,6 +209,7 @@ def sync_orangehrm_employees(
                 )
 
 
+
                 status = (
                     job_data
                     .get(
@@ -177,167 +223,135 @@ def sync_orangehrm_employees(
 
 
                 if status:
+
                     employment_status = status
 
 
-            except Exception:
 
-                errors += 1
+            #
+            # HR Identity Scope Validation
+            #
 
+            identity = {
 
-
-        # ---------------------------------
-        # Determine RBAC birthright access
-        # ---------------------------------
-
-        birthright_group = (
-            get_birthright_group(
-                department
-            )
-        )
-
-
-
-        # ---------------------------------
-        # PostgreSQL lookup
-        # ---------------------------------
-
-        employee = (
-
-            db.query(Employee)
-
-            .filter(
-                Employee.employee_id
-                ==
-                employee_id
-            )
-
-            .first()
-
-        )
-
-
-
-        # ---------------------------------
-        # CREATE
-        # ---------------------------------
-
-        if employee is None:
-
-
-            employee = Employee(
-
-                employee_id=employee_id,
-
-                first_name=first_name,
-
-                last_name=last_name,
-
-                department=department,
-
-                job_title=job_title,
-
-                employment_status=
-                    employment_status,
-
-                source_system=
-                    "OrangeHRM",
-
-            )
-
-
-            db.add(employee)
-
-
-            db.add(
-                AuditEvent(
-
-                    employee_id=
-                        employee_id,
-
-                    event_type=
-                        "Joiner Candidate",
-
-                    system=
-                        "OrangeHRM",
-
-                    result=
-                        "Created",
-
-                    details=
-                        (
-                        f"Employee imported. "
-                        f"Birthright RBAC: "
-                        f"{birthright_group}"
-                        )
-
-                )
-            )
-
-
-            created += 1
-
-
-
-        # ---------------------------------
-        # UPDATE
-        # ---------------------------------
-
-        else:
-
-
-            changed = False
-
-            fields = []
-
-
-
-            updates = {
-
-                "first_name":
-                    first_name,
-
-                "last_name":
-                    last_name,
+                "sAMAccountName":
+                    employee_id,
 
                 "department":
-                    department,
-
-                "job_title":
-                    job_title,
-
-                "employment_status":
-                    employment_status,
+                    department
 
             }
 
 
 
-            for field,value in updates.items():
+            if not is_hr_managed_user(identity):
 
 
-                if value and getattr(
-                    employee,
-                    field
-                ) != value:
+                db.add(
 
+                    AuditEvent(
 
-                    setattr(
-                        employee,
-                        field,
-                        value
+                        employee_id=employee_id,
+
+                        event_type=
+                        "Identity Excluded",
+
+                        system=
+                        "IAM Scope Engine",
+
+                        result=
+                        "Skipped",
+
+                        details=
+                        (
+                            "Identity outside HR "
+                            "managed scope"
+                        )
+
                     )
 
-
-                    changed=True
-
-                    fields.append(
-                        field
-                    )
+                )
 
 
+                skipped += 1
 
-            if changed:
+                continue
+
+
+
+
+            #
+            # Birthright RBAC
+            #
+
+            birthright_group = (
+                get_birthright_group(
+                    department
+                )
+            )
+
+
+
+            #
+            # Database lookup
+            #
+
+            employee = (
+
+                db.query(Employee)
+
+                .filter(
+
+                    Employee.employee_id
+                    ==
+                    employee_id
+
+                )
+
+                .first()
+
+            )
+
+
+
+
+            #
+            # CREATE
+            #
+
+            if employee is None:
+
+
+
+                employee = Employee(
+
+                    employee_id=
+                    employee_id,
+
+                    first_name=
+                    first_name,
+
+                    last_name=
+                    last_name,
+
+                    department=
+                    department,
+
+                    job_title=
+                    job_title,
+
+                    employment_status=
+                    employment_status,
+
+                    source_system=
+                    "OrangeHRM"
+
+                )
+
+
+                db.add(
+                    employee
+                )
 
 
                 db.add(
@@ -345,35 +359,170 @@ def sync_orangehrm_employees(
                     AuditEvent(
 
                         employee_id=
-                            employee_id,
+                        employee_id,
 
                         event_type=
-                            "Employee Sync",
+                        "Joiner Candidate",
 
                         system=
-                            "OrangeHRM",
+                        "IAM",
 
                         result=
-                            "Updated",
+                        "Created",
 
                         details=
-                            (
-                            "Changed fields: "
-                            +
-                            ", ".join(fields)
-                            )
+                        (
+                            f"Department: {department}; "
+                            f"Birthright Group: "
+                            f"{birthright_group}"
+                        )
 
                     )
 
                 )
 
 
-                updated += 1
+                created += 1
 
+
+
+            #
+            # UPDATE
+            #
 
             else:
 
-                unchanged += 1
+
+                changed = False
+
+                fields = []
+
+
+
+                updates = {
+
+
+                    "first_name":
+                    first_name,
+
+
+                    "last_name":
+                    last_name,
+
+
+                    "department":
+                    department,
+
+
+                    "job_title":
+                    job_title,
+
+
+                    "employment_status":
+                    employment_status
+
+
+                }
+
+
+
+                for field,value in updates.items():
+
+
+                    if value and getattr(
+                        employee,
+                        field
+                    ) != value:
+
+
+                        setattr(
+                            employee,
+                            field,
+                            value
+                        )
+
+
+                        changed = True
+
+                        fields.append(
+                            field
+                        )
+
+
+
+
+                if changed:
+
+
+                    db.add(
+
+                        AuditEvent(
+
+                            employee_id=
+                            employee_id,
+
+                            event_type=
+                            "Employee Sync",
+
+                            system=
+                            "OrangeHRM",
+
+                            result=
+                            "Updated",
+
+                            details=
+                            (
+                                "Changed fields: "
+                                +
+                                ", ".join(fields)
+                            )
+
+                        )
+
+                    )
+
+
+                    updated += 1
+
+
+
+                else:
+
+
+                    unchanged += 1
+
+
+
+
+        except Exception as e:
+
+
+            errors += 1
+
+
+            db.add(
+
+                AuditEvent(
+
+                    employee_id=
+                    employee_id,
+
+                    event_type=
+                    "Sync Error",
+
+                    system=
+                    "OrangeHRM",
+
+                    result=
+                    "Failed",
+
+                    details=
+                    str(e)
+
+                )
+
+            )
+
 
 
 
@@ -385,34 +534,34 @@ def sync_orangehrm_employees(
 
 
         "status":
-            "completed",
+        "completed",
 
 
         "source":
-            "OrangeHRM",
+        "OrangeHRM",
 
 
         "received":
-            len(employees),
+        len(employees),
 
 
         "created":
-            created,
+        created,
 
 
         "updated":
-            updated,
+        updated,
 
 
         "unchanged":
-            unchanged,
+        unchanged,
 
 
         "skipped":
-            skipped,
+        skipped,
 
 
         "errors":
-            errors
+        errors
 
     }
