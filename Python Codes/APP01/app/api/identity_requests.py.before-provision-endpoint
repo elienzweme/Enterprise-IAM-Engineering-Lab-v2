@@ -1,0 +1,855 @@
+# app/api/identity_requests.py
+
+"""
+Identity Request API
+
+This module exposes the API workflow for IAM lifecycle requests.
+
+Lifecycle flow:
+
+    OrangeHRM
+        ↓
+    APP01 Employee Synchronization
+        ↓
+    Identity Request
+        ↓
+    Pending
+        ↓
+    Approval / Rejection
+        ↓
+    Approved
+        ↓
+    Provisioning
+        ↓
+    Active Directory
+        ↓
+    Completed / Failed
+
+
+Responsibilities of this API module:
+
+- list identity requests
+- retrieve a specific identity request
+- approve identity requests
+- reject identity requests
+- provision approved requests
+- list pending requests
+
+Active Directory write operations are NOT implemented here.
+
+Actual AD provisioning is delegated to:
+
+    app.services.provisioning_service.execute_identity_request()
+
+Supported provisioning execution:
+
+    JOINER = enabled
+    MOVER  = enabled
+    LEAVER = not enabled yet
+"""
+
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+)
+
+from sqlalchemy.orm import Session
+
+
+from app.database import get_db
+
+from app.models.models import (
+    Employee,
+    IdentityRequest,
+)
+
+from app.api.schemas import (
+    ApprovalRequest,
+    RejectionRequest,
+)
+
+from app.services.provisioning_service import (
+    create_audit_event,
+    execute_identity_request,
+)
+
+
+# ============================================================
+# Router
+# ============================================================
+
+router = APIRouter(
+    prefix="/identity-requests",
+    tags=["Identity Requests"],
+)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def identity_request_to_dict(
+    request: IdentityRequest,
+) -> dict:
+    """
+    Convert an IdentityRequest SQLAlchemy model into a
+    JSON-serializable dictionary.
+    """
+
+    return {
+        "id":
+            request.id,
+
+        "request_id":
+            request.request_id,
+
+        "employee_id":
+            request.employee_id,
+
+        "action":
+            request.action,
+
+        "status":
+            request.status,
+
+        "jira_issue_key":
+            request.jira_issue_key,
+
+        "requested_by":
+            request.requested_by,
+
+        "approved_by":
+            request.approved_by,
+
+        "created_at":
+            request.created_at,
+
+        "completed_at":
+            request.completed_at,
+    }
+
+
+def employee_to_dict(
+    employee: Employee | None,
+) -> dict | None:
+    """
+    Convert an Employee model into a JSON-safe dictionary.
+    """
+
+    if employee is None:
+        return None
+
+    return {
+        "employee_id":
+            employee.employee_id,
+
+        "first_name":
+            employee.first_name,
+
+        "last_name":
+            employee.last_name,
+
+        "email":
+            employee.email,
+
+        "department":
+            employee.department,
+
+        "job_title":
+            employee.job_title,
+
+        "manager":
+            employee.manager,
+
+        "employment_status":
+            employee.employment_status,
+
+        "source_system":
+            employee.source_system,
+    }
+
+
+def get_request_or_404(
+    db: Session,
+    request_id: str,
+) -> IdentityRequest:
+    """
+    Retrieve an identity request or return HTTP 404.
+    """
+
+    request = (
+        db.query(IdentityRequest)
+        .filter(
+            IdentityRequest.request_id
+            == request_id
+        )
+        .first()
+    )
+
+    if request is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Identity request not found: "
+                f"{request_id}"
+            ),
+        )
+
+    return request
+
+
+def get_employee_for_request(
+    db: Session,
+    request: IdentityRequest,
+) -> Employee | None:
+    """
+    Return the Employee associated with an IdentityRequest.
+    """
+
+    return (
+        db.query(Employee)
+        .filter(
+            Employee.employee_id
+            == request.employee_id
+        )
+        .first()
+    )
+
+
+# ============================================================
+# LIST IDENTITY REQUESTS
+# ============================================================
+
+@router.get("")
+def list_identity_requests(
+    status: str | None = Query(
+        default=None,
+        description=(
+            "Filter by request status "
+            "(Pending, Approved, Provisioning, "
+            "Completed, Failed, Rejected)"
+        ),
+    ),
+    action: str | None = Query(
+        default=None,
+        description=(
+            "Filter by lifecycle action "
+            "(JOINER, MOVER, LEAVER)"
+        ),
+    ),
+    employee_id: str | None = Query(
+        default=None,
+        description="Filter by employee ID",
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    List identity lifecycle requests.
+
+    Optional filters:
+
+        status
+        action
+        employee_id
+
+    Examples:
+
+        /identity-requests
+
+        /identity-requests?status=Pending
+
+        /identity-requests?action=JOINER
+
+        /identity-requests?employee_id=0033
+
+        /identity-requests?status=Approved&action=JOINER
+    """
+
+    query = db.query(
+        IdentityRequest
+    )
+
+    if status:
+        query = query.filter(
+            IdentityRequest.status
+            == status.strip()
+        )
+
+    if action:
+        query = query.filter(
+            IdentityRequest.action
+            == action.strip().upper()
+        )
+
+    if employee_id:
+        query = query.filter(
+            IdentityRequest.employee_id
+            == employee_id.strip()
+        )
+
+    requests = (
+        query
+        .order_by(
+            IdentityRequest.created_at.desc()
+        )
+        .all()
+    )
+
+    return {
+        "count":
+            len(requests),
+
+        "requests": [
+            identity_request_to_dict(
+                request
+            )
+            for request in requests
+        ],
+    }
+
+
+# ============================================================
+# GET PENDING IDENTITY REQUESTS
+# ============================================================
+
+@router.get("/status/pending")
+def get_pending_identity_requests(
+    db: Session = Depends(get_db),
+):
+    """
+    Return identity requests currently waiting for approval.
+
+    Lifecycle state:
+
+        Pending
+            ↓
+        Approval or Rejection
+    """
+
+    requests = (
+        db.query(IdentityRequest)
+        .filter(
+            IdentityRequest.status
+            == "Pending"
+        )
+        .order_by(
+            IdentityRequest.created_at.asc()
+        )
+        .all()
+    )
+
+    return {
+        "count":
+            len(requests),
+
+        "requests": [
+            identity_request_to_dict(
+                request
+            )
+            for request in requests
+        ],
+    }
+
+
+# ============================================================
+# GET IDENTITY REQUEST
+# ============================================================
+
+@router.get("/{request_id}")
+def get_identity_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Retrieve one identity request together with the current
+    Employee record from APP01.
+
+    This allows an approver to review:
+
+    - employee ID
+    - employee name
+    - department
+    - job title
+    - manager
+    - employment status
+    - source system
+    - lifecycle action
+    - request status
+
+    before approving provisioning.
+    """
+
+    request = get_request_or_404(
+        db=db,
+        request_id=request_id,
+    )
+
+    employee = get_employee_for_request(
+        db=db,
+        request=request,
+    )
+
+    return {
+        "request":
+            identity_request_to_dict(
+                request
+            ),
+
+        "employee":
+            employee_to_dict(
+                employee
+            ),
+    }
+
+
+# ============================================================
+# APPROVE IDENTITY REQUEST
+# ============================================================
+
+@router.post("/{request_id}/approve")
+def approve_identity_request(
+    request_id: str,
+    approval: ApprovalRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Approve a pending Joiner, Mover, or Leaver request.
+
+    IMPORTANT:
+
+    Approval does NOT directly modify Active Directory.
+
+    It changes the workflow from:
+
+        Pending
+            ↓
+        Approved
+
+    After approval, provisioning must be explicitly executed
+    through:
+
+        POST
+        /identity-requests/{request_id}/provision
+
+    This creates a security boundary between:
+
+        approval
+
+    and
+
+        privileged Active Directory modification.
+    """
+
+    request = get_request_or_404(
+        db=db,
+        request_id=request_id,
+    )
+
+    # --------------------------------------------------------
+    # State validation
+    # --------------------------------------------------------
+
+    if request.status != "Pending":
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only Pending identity requests "
+                "can be approved. "
+                f"Current status: {request.status}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Validate approver
+    # --------------------------------------------------------
+
+    approver = (
+        approval.approved_by.strip()
+    )
+
+    if not approver:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "approved_by cannot be empty"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Mark Approved
+    # --------------------------------------------------------
+
+    request.status = "Approved"
+
+    request.approved_by = (
+        approver
+    )
+
+    # --------------------------------------------------------
+    # Audit
+    # --------------------------------------------------------
+
+    create_audit_event(
+        db=db,
+        request=request,
+        event_type=(
+            "IDENTITY_REQUEST_APPROVED"
+        ),
+        result="SUCCESS",
+        details={
+            "action":
+                request.action,
+
+            "approved_by":
+                approver,
+
+            "message": (
+                "Identity request approved "
+                "and ready for provisioning."
+            ),
+        },
+    )
+
+    # --------------------------------------------------------
+    # Commit
+    # --------------------------------------------------------
+
+    try:
+
+        db.commit()
+
+        db.refresh(
+            request
+        )
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to approve request: "
+                f"{exc}"
+            ),
+        ) from exc
+
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
+
+    return {
+        "message":
+            "Identity request approved",
+
+        "request":
+            identity_request_to_dict(
+                request
+            ),
+
+        "provisioning_started":
+            False,
+
+        "next_stage":
+            "AD provisioning",
+
+        "provision_endpoint": (
+            "/identity-requests/"
+            f"{request.request_id}"
+            "/provision"
+        ),
+    }
+
+
+# ============================================================
+# PROVISION APPROVED IDENTITY REQUEST
+# ============================================================
+
+@router.post("/{request_id}/provision")
+def provision_identity_request(
+    request_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Execute Active Directory provisioning for an approved
+    Joiner or Mover identity request.
+
+    Workflow:
+
+        Pending
+            ↓
+        Approved
+            ↓
+        Provisioning
+            ↓
+        Active Directory
+            ↓
+        Verification
+            ↓
+        Completed
+
+    The provisioning service is responsible for:
+
+    - validating the approval boundary
+    - verifying request state
+    - loading the Employee record
+    - loading existing AD identity state
+    - preparing the AD provisioning plan
+    - validating the IAM mapping
+    - generating the username
+    - generating the UPN
+    - determining the target OU
+    - determining birthright groups
+    - resolving the manager
+    - executing JOINER changes
+    - executing MOVER changes
+    - recording provisioning audit events
+    - marking the request Completed
+    - marking the request Failed if execution fails
+
+    Current execution support:
+
+        JOINER = enabled
+        MOVER  = enabled
+        LEAVER = not enabled yet
+
+    This endpoint intentionally contains no LDAP/LDAPS
+    implementation.
+
+    All Active Directory changes are delegated to the
+    provisioning service.
+    """
+
+    try:
+
+        result = execute_identity_request(
+            request_id=request_id,
+            db=db,
+        )
+
+        return result
+
+    except ValueError as exc:
+
+        # ----------------------------------------------------
+        # Workflow / business-state conflict
+        #
+        # Examples:
+        #
+        # - request is not Approved
+        # - request already Completed
+        # - no AD changes required
+        # - provisioning execution disabled
+        # - unsupported lifecycle action
+        # ----------------------------------------------------
+
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        ) from exc
+
+    except RuntimeError as exc:
+
+        # ----------------------------------------------------
+        # Provisioning engine failure
+        #
+        # Examples:
+        #
+        # - LDAP/LDAPS write failed
+        # - AD account creation failed
+        # - group assignment failed
+        # - manager assignment failed
+        # - AD move failed
+        # ----------------------------------------------------
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        ) from exc
+
+    except HTTPException:
+
+        # Preserve any HTTPException generated downstream.
+        raise
+
+    except Exception as exc:
+
+        # ----------------------------------------------------
+        # Unexpected failure
+        # ----------------------------------------------------
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unexpected provisioning failure: "
+                f"{exc}"
+            ),
+        ) from exc
+
+
+# ============================================================
+# REJECT IDENTITY REQUEST
+# ============================================================
+
+@router.post("/{request_id}/reject")
+def reject_identity_request(
+    request_id: str,
+    rejection: RejectionRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Reject a pending lifecycle request.
+
+    Workflow:
+
+        Pending
+            ↓
+        Rejected
+
+    Rejected requests will not proceed to AD provisioning.
+    """
+
+    request = get_request_or_404(
+        db=db,
+        request_id=request_id,
+    )
+
+    # --------------------------------------------------------
+    # State validation
+    # --------------------------------------------------------
+
+    if request.status != "Pending":
+
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only Pending identity requests "
+                "can be rejected. "
+                f"Current status: {request.status}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Validate reviewer
+    # --------------------------------------------------------
+
+    rejected_by = (
+        rejection.rejected_by.strip()
+    )
+
+    if not rejected_by:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "rejected_by cannot be empty"
+            ),
+        )
+
+    reason = (
+        rejection.reason.strip()
+        if rejection.reason
+        else ""
+    )
+
+    # --------------------------------------------------------
+    # Mark Rejected
+    # --------------------------------------------------------
+
+    request.status = "Rejected"
+
+    # --------------------------------------------------------
+    # Current database model has approved_by but does not yet
+    # have rejected_by.
+    #
+    # Store the reviewer temporarily in approved_by.
+    #
+    # This can later be replaced with a dedicated rejected_by
+    # column if desired.
+    # --------------------------------------------------------
+
+    request.approved_by = (
+        rejected_by
+    )
+
+    request.completed_at = (
+        datetime.utcnow()
+    )
+
+    # --------------------------------------------------------
+    # Audit
+    # --------------------------------------------------------
+
+    create_audit_event(
+        db=db,
+        request=request,
+        event_type=(
+            "IDENTITY_REQUEST_REJECTED"
+        ),
+        result="REJECTED",
+        details={
+            "action":
+                request.action,
+
+            "rejected_by":
+                rejected_by,
+
+            "reason":
+                reason,
+
+            "message": (
+                "Identity request rejected. "
+                "No provisioning will occur."
+            ),
+        },
+    )
+
+    # --------------------------------------------------------
+    # Commit
+    # --------------------------------------------------------
+
+    try:
+
+        db.commit()
+
+        db.refresh(
+            request
+        )
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to reject request: "
+                f"{exc}"
+            ),
+        ) from exc
+
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
+
+    return {
+        "message":
+            "Identity request rejected",
+
+        "request":
+            identity_request_to_dict(
+                request
+            ),
+
+        "provisioning_started":
+            False,
+    }
