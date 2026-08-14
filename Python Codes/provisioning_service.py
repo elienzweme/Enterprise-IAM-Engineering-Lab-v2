@@ -13,13 +13,18 @@ from app.models.models import (
 
 from app.services.ad_service import (
     get_user_by_employee_id,
+    reconcile_ad_identity,
     test_ad_connection,
     create_ad_user,
     update_ad_user,
+    generate_temporary_password,
+    set_ad_password,
+    require_password_change_at_next_logon,
     enable_ad_user,
     move_ad_user,
     add_user_to_group,
     remove_user_from_group,
+    set_ad_manager,
 )
 
 from app.config.identity_mapping import (
@@ -145,6 +150,54 @@ def get_employee(
 
 
 # ============================================================
+# Secret Redaction
+# ============================================================
+
+SENSITIVE_KEYS = {
+    "password",
+    "temporary_password",
+    "credential",
+    "secret",
+    "token",
+    "access_token",
+    "refresh_token",
+}
+
+
+def redact_secrets(value):
+    """
+    Recursively redact secrets before writing audit details.
+
+    The JOINER response may contain a one-time temporary password,
+    but AuditEvent.details must never persist it.
+    """
+    if isinstance(value, dict):
+        sanitized = {}
+
+        for key, item in value.items():
+            if str(key).lower() in SENSITIVE_KEYS:
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = redact_secrets(item)
+
+        return sanitized
+
+    if isinstance(value, list):
+        return [
+            redact_secrets(item)
+            for item in value
+        ]
+
+    if isinstance(value, tuple):
+        return tuple(
+            redact_secrets(item)
+            for item in value
+        )
+
+    return value
+
+
+# ============================================================
 # Audit Helper
 # ============================================================
 
@@ -166,7 +219,7 @@ def create_audit_event(
         system="Active Directory",
         result=result,
         details=json.dumps(
-            details,
+            redact_secrets(details),
             default=str,
         ),
         timestamp=datetime.utcnow(),
@@ -398,58 +451,40 @@ def calculate_group_changes(
 
 def prepare_joiner(
     employee: Employee,
-    ad_user: dict | None,
+    correlation: dict,
 ) -> dict:
     """
-    Prepare JOINER operation.
-
-    JOINER execution is enabled after approval and preparation.
+    Prepare a JOINER as either a new account or a safe adoption/reconciliation
+    of an existing legacy account.
     """
-
-    if ad_user:
-
-        raise ValueError(
-            (
-                f"Employee {employee.employee_id} "
-                "already exists in Active Directory."
-            )
-        )
-
-    mapping = get_employee_identity_mapping(
-        employee
-    )
+    mapping = get_employee_identity_mapping(employee)
+    ad_user = correlation.get("ad_user")
+    adopted = bool(ad_user)
 
     return {
-        "operation":
-            "CREATE_AD_USER",
-
-        "employee_id":
-            employee.employee_id,
-
-        "desired_state":
-            employee_snapshot(
-                employee
-            ),
-
+        "operation": (
+            "ADOPT_EXISTING_AD_USER"
+            if adopted
+            else "CREATE_AD_USER"
+        ),
+        "employee_id": employee.employee_id,
+        "desired_state": employee_snapshot(employee),
         "identity_mapping": {
-            "target_ou":
-                mapping["ou"],
-
-            "birthright_groups":
-                mapping["groups"],
-
-            "birthright_group_dns":
-                mapping["group_dns"],
+            "target_ou": mapping["ou"],
+            "birthright_groups": mapping["groups"],
+            "birthright_group_dns": mapping["group_dns"],
         },
-
-        "ready_for_ad_write":
-            True,
-
-        "ad_write_executed":
-            False,
-
-        "execution_enabled":
-            True,
+        "correlation": {
+            "method": correlation.get("correlation_method"),
+            "employee_id_backfilled": correlation.get("employee_id_backfilled", False),
+            "legacy_account_adopted": correlation.get("legacy_account_adopted", False),
+            "sam_account_name": correlation.get("sam_account_name"),
+        },
+        "current_ad_state": ad_user,
+        "preserve_existing_password": adopted,
+        "ready_for_ad_write": True,
+        "ad_write_executed": False,
+        "execution_enabled": True,
     }
 
 
@@ -749,18 +784,20 @@ def prepare_identity_request_for_provisioning(
             "Unable to connect to Active Directory."
         )
 
-    ad_user = get_user_by_employee_id(
-        employee.employee_id
-    )
-
     if action == "JOINER":
-
+        correlation = reconcile_ad_identity(
+            employee_id=employee.employee_id,
+            first_name=employee.first_name,
+            last_name=employee.last_name,
+        )
+        ad_user = correlation.get("ad_user")
         operation = prepare_joiner(
             employee,
-            ad_user,
+            correlation,
         )
 
     elif action == "MOVER":
+        ad_user = get_user_by_employee_id(employee.employee_id)
 
         operation = prepare_mover(
             employee,
@@ -768,6 +805,7 @@ def prepare_identity_request_for_provisioning(
         )
 
     elif action == "LEAVER":
+        ad_user = get_user_by_employee_id(employee.employee_id)
 
         operation = prepare_leaver(
             employee,
@@ -844,58 +882,103 @@ def execute_joiner(
     Execute an approved JOINER request against Active Directory.
 
     Execution flow:
-        1. Validate the employee does not already exist in AD
-        2. Create the AD user
-        3. Add birthright group memberships
-        4. Enable the AD account
-        5. Read the account back from AD
-        6. Verify the final state
+        1. Normalize/validate the approved provisioning plan
+        2. Create the user disabled OR safely resume a partial JOINER
+        3. Generate a cryptographically random temporary password
+        4. Set the password over LDAPS
+        5. Require password change at next logon
+        6. Add birthright group memberships
+        7. Enable the account
+        8. Read the account back and verify final state
 
-    This function performs actual Active Directory writes.
+    The temporary password is returned ONCE to the caller and is
+    automatically redacted from AuditEvent.details.
     """
 
     employee_id = str(employee.employee_id)
 
-    operation = plan.get(
-        "operation",
+    # ---------------------------------------------------------
+    # Normalize the provisioning plan
+    # ---------------------------------------------------------
+
+    if (
+        isinstance(plan, dict)
+        and isinstance(
+            plan.get("desired_state"),
+            dict,
+        )
+    ):
+        operation_data = plan
+
+    elif (
+        isinstance(plan, dict)
+        and isinstance(
+            plan.get("operation"),
+            dict,
+        )
+    ):
+        operation_data = plan[
+            "operation"
+        ]
+
+    else:
+        raise ValueError(
+            f"JOINER {employee_id}: invalid provisioning plan structure."
+        )
+
+    desired_state = operation_data.get(
+        "desired_state",
         {},
     )
 
-    desired_state = operation.get(
-        "desired_state",
-        plan.get(
-            "desired_state",
-            {},
-        ),
+    identity_mapping = operation_data.get(
+        "identity_mapping",
+        {},
     )
 
-    identity_mapping = operation.get(
-        "identity_mapping",
-        plan.get(
-            "identity_mapping",
-            {},
-        ),
+    operation_name = operation_data.get(
+        "operation"
     )
+
+    if operation_name not in {"CREATE_AD_USER", "ADOPT_EXISTING_AD_USER"}:
+        raise ValueError(
+            f"JOINER {employee_id}: unsupported operation {operation_name!r}."
+        )
+
+    adopting_existing = operation_name == "ADOPT_EXISTING_AD_USER"
 
     # ---------------------------------------------------------
-    # Desired identity attributes
+    # Desired identity
     # ---------------------------------------------------------
 
     first_name = desired_state.get(
         "first_name"
     )
+
     last_name = desired_state.get(
         "last_name"
     )
+
     department = desired_state.get(
         "department"
     )
+
     job_title = desired_state.get(
         "job_title"
     )
+
     email = desired_state.get(
         "email"
     )
+
+    # manager_employee_id should be the HR employeeId of the supervisor.
+    # For backward compatibility, a manager value that looks like an
+    # employee ID is also accepted.
+    manager_employee_id = desired_state.get("manager_employee_id")
+    if not manager_employee_id:
+        manager_value = desired_state.get("manager")
+        if manager_value and str(manager_value).strip().isdigit():
+            manager_employee_id = str(manager_value).strip()
 
     if not first_name:
         raise ValueError(
@@ -912,78 +995,111 @@ def execute_joiner(
             f"JOINER {employee_id}: department is required."
         )
 
-    # ---------------------------------------------------------
-    # Identity mapping
-    # ---------------------------------------------------------
-
     target_ou = identity_mapping.get(
         "target_ou"
     )
 
-    birthright_group_dns = identity_mapping.get(
-        "birthright_group_dns",
-        [],
+    birthright_group_dns = (
+        identity_mapping.get(
+            "birthright_group_dns",
+            [],
+        )
     )
 
     if not target_ou:
         raise ValueError(
-            f"JOINER {employee_id}: no target OU mapping "
-            f"exists for department '{department}'."
+            f"JOINER {employee_id}: no target OU mapping exists "
+            f"for department '{department}'."
         )
 
     # ---------------------------------------------------------
-    # Generate account name
-    #
-    # Raylene Christopher
-    #       ↓
-    # raylene.christopher
+    # firstname.lastname
     # ---------------------------------------------------------
 
     sam_account_name = (
         f"{first_name}.{last_name}"
         .strip()
         .lower()
-        .replace(
-            " ",
-            "",
+        .replace(" ", "")
+    )
+
+    # ---------------------------------------------------------
+    # Create, adopt, or resume
+    # ---------------------------------------------------------
+
+    existing_user = get_user_by_employee_id(employee_id)
+
+    if adopting_existing:
+        if not existing_user:
+            raise RuntimeError(
+                f"JOINER adoption failed for employee {employee_id}: "
+                "the correlated AD account can no longer be found."
+            )
+
+        sam_account_name = existing_user.get("sam_account_name") or sam_account_name
+
+        create_result = {
+            "success": True,
+            "operation": "ADOPT_EXISTING_AD_USER",
+            "employee_id": employee_id,
+            "creation_skipped": True,
+            "existing_account_preserved": True,
+            "password_preserved": True,
+            "distinguished_name": existing_user.get("distinguished_name"),
+            "sam_account_name": sam_account_name,
+        }
+
+        # Reconcile ordinary HR-controlled attributes.
+        update_ad_user(
+            employee_id=employee_id,
+            department=department,
+            job_title=job_title,
+            email=email,
         )
-    )
 
-    # ---------------------------------------------------------
-    # Pre-check
-    #
-    # JOINER must never overwrite an existing AD identity.
-    # ---------------------------------------------------------
+        current_dn = existing_user.get("distinguished_name")
+        if normalize_dn(get_parent_dn(current_dn)) != normalize_dn(target_ou):
+            move_ad_user(employee_id=employee_id, target_ou=target_ou)
 
-    existing_user = get_user_by_employee_id(
-        employee_id
-    )
+    elif existing_user:
+        existing_sam = existing_user.get("sam_account_name") or ""
 
-    if existing_user:
-        raise RuntimeError(
-            f"JOINER execution refused. "
-            f"Employee {employee_id} already exists in "
-            f"Active Directory as "
-            f"{existing_user.get('distinguished_name')}."
+        if existing_sam.lower() != sam_account_name.lower():
+            raise RuntimeError(
+                f"JOINER recovery refused for employee {employee_id}. "
+                f"Expected account '{sam_account_name}', but AD contains "
+                f"'{existing_sam}'. Manual review is required."
+            )
+
+        if existing_user.get("enabled"):
+            raise RuntimeError(
+                f"JOINER recovery refused for employee {employee_id}. "
+                "Existing account is enabled; manual review is required."
+            )
+
+        create_result = {
+            "success": True,
+            "operation": "CREATE_AD_USER",
+            "employee_id": employee_id,
+            "resumed_partial_joiner": True,
+            "creation_skipped": True,
+            "distinguished_name": existing_user.get("distinguished_name"),
+            "sam_account_name": existing_sam,
+        }
+    else:
+        create_result = create_ad_user(
+            employee_id=employee_id,
+            first_name=first_name,
+            last_name=last_name,
+            department=department,
+            job_title=job_title,
+            email=email,
+            target_ou=target_ou,
+            sam_account_name=sam_account_name,
         )
 
     # ---------------------------------------------------------
-    # CREATE AD USER
-    # ---------------------------------------------------------
-
-    create_result = create_ad_user(
-        employee_id=employee_id,
-        first_name=first_name,
-        last_name=last_name,
-        department=department,
-        job_title=job_title,
-        email=email,
-        target_ou=target_ou,
-        sam_account_name=sam_account_name,
-    )
-
-    # ---------------------------------------------------------
-    # Verify account exists before continuing
+    # Verify user exists
     # ---------------------------------------------------------
 
     created_user = get_user_by_employee_id(
@@ -992,8 +1108,28 @@ def execute_joiner(
 
     if not created_user:
         raise RuntimeError(
-            f"JOINER verification failed after account creation. "
+            f"JOINER verification failed after account creation/recovery. "
             f"Employee {employee_id} cannot be found in AD."
+        )
+
+    # ---------------------------------------------------------
+    # Password handling
+    # ---------------------------------------------------------
+
+    temporary_password = None
+    password_result = None
+    password_change_result = None
+
+    if not adopting_existing:
+        temporary_password = generate_temporary_password()
+
+        password_result = set_ad_password(
+            employee_id=employee_id,
+            password=temporary_password,
+        )
+
+        password_change_result = require_password_change_at_next_logon(
+            employee_id=employee_id,
         )
 
     # ---------------------------------------------------------
@@ -1013,23 +1149,51 @@ def execute_joiner(
         )
 
     # ---------------------------------------------------------
-    # Enable account
-    #
-    # create_ad_user() intentionally creates the account
-    # disabled. Enablement occurs only after successful creation
-    # and birthright assignment.
+    # Enable account only after password + groups succeed
     # ---------------------------------------------------------
 
-    enable_result = enable_ad_user(
-        employee_id=employee_id
-    )
+    if adopting_existing:
+        enable_result = {
+            "success": True,
+            "changed": False,
+            "preserved_existing_state": True,
+            "enabled": created_user.get("enabled"),
+        }
+    else:
+        enable_result = enable_ad_user(
+            employee_id=employee_id
+        )
 
     # ---------------------------------------------------------
-    # Final AD verification
+    # Manager assignment
     # ---------------------------------------------------------
 
-    verified_ad_state = get_user_by_employee_id(
-        employee_id
+    manager_result = None
+    if manager_employee_id:
+        manager_ad_user = get_user_by_employee_id(str(manager_employee_id))
+        if manager_ad_user:
+            manager_result = set_ad_manager(
+                employee_id=employee_id,
+                manager_employee_id=str(manager_employee_id),
+            )
+        else:
+            # Do not fail a valid JOINER only because the supervisor has not
+            # been provisioned yet. A later synchronization can apply it.
+            manager_result = {
+                "success": False,
+                "deferred": True,
+                "manager_employee_id": str(manager_employee_id),
+                "message": "Manager is not yet present in Active Directory; assignment deferred.",
+            }
+
+    # ---------------------------------------------------------
+    # Final verification
+    # ---------------------------------------------------------
+
+    verified_ad_state = (
+        get_user_by_employee_id(
+            employee_id
+        )
     )
 
     if not verified_ad_state:
@@ -1037,10 +1201,6 @@ def execute_joiner(
             f"JOINER final verification failed. "
             f"Employee {employee_id} cannot be found in AD."
         )
-
-    # ---------------------------------------------------------
-    # Verify target OU
-    # ---------------------------------------------------------
 
     final_dn = (
         verified_ad_state.get(
@@ -1054,44 +1214,43 @@ def execute_joiner(
         not in normalize_dn(final_dn)
     ):
         raise RuntimeError(
-            f"JOINER OU verification failed for "
-            f"employee {employee_id}. "
-            f"Expected OU '{target_ou}', "
-            f"found DN '{final_dn}'."
+            f"JOINER OU verification failed for employee {employee_id}. "
+            f"Expected OU '{target_ou}', found DN '{final_dn}'."
         )
-
-    # ---------------------------------------------------------
-    # Verify birthright groups
-    # ---------------------------------------------------------
 
     final_groups = {
         normalize_dn(group)
-        for group in verified_ad_state.get(
-            "groups",
-            [],
+        for group in (
+            verified_ad_state.get(
+                "groups",
+                [],
+            )
         )
     }
 
     missing_groups = [
         group_dn
-        for group_dn in birthright_group_dns
-        if normalize_dn(group_dn) not in final_groups
+        for group_dn
+        in birthright_group_dns
+        if (
+            normalize_dn(group_dn)
+            not in final_groups
+        )
     ]
 
     if missing_groups:
         raise RuntimeError(
-            f"JOINER group verification failed for "
-            f"employee {employee_id}. "
-            f"Missing groups: {missing_groups}"
+            f"JOINER group verification failed for employee "
+            f"{employee_id}. Missing groups: {missing_groups}"
         )
 
-    # ---------------------------------------------------------
-    # Verify account enabled
-    # ---------------------------------------------------------
-
-    if verified_ad_state.get(
-        "enabled"
-    ) is not True:
+    if (
+        not adopting_existing
+        and verified_ad_state.get(
+            "enabled"
+        )
+        is not True
+    ):
         raise RuntimeError(
             f"JOINER enablement verification failed for "
             f"employee {employee_id}."
@@ -1104,11 +1263,32 @@ def execute_joiner(
         "sam_account_name":
             sam_account_name,
 
+        "user_principal_name":
+            verified_ad_state.get(
+                "user_principal_name"
+            ),
+
+        # IMPORTANT:
+        # This secret is intended to be shown once to the authorized
+        # operator/secure-delivery service. create_audit_event()
+        # redacts it before persistence.
+        "temporary_password":
+            temporary_password,
+
+        "must_change_password_at_next_logon":
+            (not adopting_existing),
+
         "target_ou":
             target_ou,
 
         "create_user":
             create_result,
+
+        "password_set":
+            password_result,
+
+        "password_change_required":
+            password_change_result,
 
         "groups_added":
             groups_added,
@@ -1121,6 +1301,8 @@ def execute_joiner(
 
         "success":
             True,
+        "adopted_existing_account": adopting_existing,
+        "manager_result": manager_result,
     }
 
 
@@ -1352,17 +1534,23 @@ def execute_identity_request(
     # Prepare exact plan
     # ========================================================
 
-    ad_user = get_user_by_employee_id(
-        employee.employee_id
-    )
-
     if action == "JOINER":
+        correlation = reconcile_ad_identity(
+            employee_id=employee.employee_id,
+            first_name=employee.first_name,
+            last_name=employee.last_name,
+        )
+
         plan = prepare_joiner(
             employee=employee,
-            ad_user=ad_user,
+            correlation=correlation,
         )
 
     elif action == "MOVER":
+        ad_user = get_user_by_employee_id(
+            employee.employee_id
+        )
+
         plan = prepare_mover(
             employee=employee,
             ad_user=ad_user,
