@@ -13,18 +13,16 @@ from app.models.models import (
 
 from app.services.ad_service import (
     get_user_by_employee_id,
-    reconcile_ad_identity,
     test_ad_connection,
     create_ad_user,
     update_ad_user,
-    generate_temporary_password,
-    set_ad_password,
-    require_password_change_at_next_logon,
     enable_ad_user,
+    disable_ad_user,
     move_ad_user,
     add_user_to_group,
     remove_user_from_group,
     set_ad_manager,
+    AD_DISABLED_USERS_OU,
 )
 
 from app.config.identity_mapping import (
@@ -150,54 +148,6 @@ def get_employee(
 
 
 # ============================================================
-# Secret Redaction
-# ============================================================
-
-SENSITIVE_KEYS = {
-    "password",
-    "temporary_password",
-    "credential",
-    "secret",
-    "token",
-    "access_token",
-    "refresh_token",
-}
-
-
-def redact_secrets(value):
-    """
-    Recursively redact secrets before writing audit details.
-
-    The JOINER response may contain a one-time temporary password,
-    but AuditEvent.details must never persist it.
-    """
-    if isinstance(value, dict):
-        sanitized = {}
-
-        for key, item in value.items():
-            if str(key).lower() in SENSITIVE_KEYS:
-                sanitized[key] = "[REDACTED]"
-            else:
-                sanitized[key] = redact_secrets(item)
-
-        return sanitized
-
-    if isinstance(value, list):
-        return [
-            redact_secrets(item)
-            for item in value
-        ]
-
-    if isinstance(value, tuple):
-        return tuple(
-            redact_secrets(item)
-            for item in value
-        )
-
-    return value
-
-
-# ============================================================
 # Audit Helper
 # ============================================================
 
@@ -219,7 +169,7 @@ def create_audit_event(
         system="Active Directory",
         result=result,
         details=json.dumps(
-            redact_secrets(details),
+            details,
             default=str,
         ),
         timestamp=datetime.utcnow(),
@@ -250,13 +200,19 @@ def validate_request_for_provisioning(
             f"Unsupported lifecycle action: {action}"
         )
 
-    if request.status != "Approved":
+    allowed_statuses = {
+        "Approved",
+        "Failed",
+    }
+
+    if request.status not in allowed_statuses:
 
         raise ValueError(
             (
                 f"Request {request.request_id} "
                 f"has status '{request.status}'. "
-                "Only Approved requests can be provisioned."
+                "Only Approved requests or previously "
+                "Failed requests can be provisioned."
             )
         )
 
@@ -451,40 +407,58 @@ def calculate_group_changes(
 
 def prepare_joiner(
     employee: Employee,
-    correlation: dict,
+    ad_user: dict | None,
 ) -> dict:
     """
-    Prepare a JOINER as either a new account or a safe adoption/reconciliation
-    of an existing legacy account.
+    Prepare JOINER operation.
+
+    JOINER execution is enabled after approval and preparation.
     """
-    mapping = get_employee_identity_mapping(employee)
-    ad_user = correlation.get("ad_user")
-    adopted = bool(ad_user)
+
+    if ad_user:
+
+        raise ValueError(
+            (
+                f"Employee {employee.employee_id} "
+                "already exists in Active Directory."
+            )
+        )
+
+    mapping = get_employee_identity_mapping(
+        employee
+    )
 
     return {
-        "operation": (
-            "ADOPT_EXISTING_AD_USER"
-            if adopted
-            else "CREATE_AD_USER"
-        ),
-        "employee_id": employee.employee_id,
-        "desired_state": employee_snapshot(employee),
+        "operation":
+            "CREATE_AD_USER",
+
+        "employee_id":
+            employee.employee_id,
+
+        "desired_state":
+            employee_snapshot(
+                employee
+            ),
+
         "identity_mapping": {
-            "target_ou": mapping["ou"],
-            "birthright_groups": mapping["groups"],
-            "birthright_group_dns": mapping["group_dns"],
+            "target_ou":
+                mapping["ou"],
+
+            "birthright_groups":
+                mapping["groups"],
+
+            "birthright_group_dns":
+                mapping["group_dns"],
         },
-        "correlation": {
-            "method": correlation.get("correlation_method"),
-            "employee_id_backfilled": correlation.get("employee_id_backfilled", False),
-            "legacy_account_adopted": correlation.get("legacy_account_adopted", False),
-            "sam_account_name": correlation.get("sam_account_name"),
-        },
-        "current_ad_state": ad_user,
-        "preserve_existing_password": adopted,
-        "ready_for_ad_write": True,
-        "ad_write_executed": False,
-        "execution_enabled": True,
+
+        "ready_for_ad_write":
+            True,
+
+        "ad_write_executed":
+            False,
+
+        "execution_enabled":
+            True,
     }
 
 
@@ -707,13 +681,14 @@ def prepare_leaver(
     ad_user: dict | None,
 ) -> dict:
     """
-    Prepare LEAVER operation.
+    Prepare an idempotent LEAVER operation.
 
-    LEAVER execution is intentionally not enabled yet.
+    The LEAVER plan disables the account, removes IAM-managed
+    birthright groups, clears the manager, and moves the user to
+    the configured Disabled Users OU.
     """
 
     if not ad_user:
-
         raise ValueError(
             (
                 f"Employee {employee.employee_id} "
@@ -721,24 +696,69 @@ def prepare_leaver(
             )
         )
 
+    employee_id = str(employee.employee_id)
+    current_groups = ad_user.get("groups", []) or []
+    managed_birthright_dns = get_all_managed_birthright_group_dns()
+
+    groups_to_remove = []
+    for group_dn in current_groups:
+        if normalize_dn(group_dn) in managed_birthright_dns:
+            groups_to_remove.append(group_dn)
+
+    current_dn = ad_user.get("distinguished_name")
+    current_ou = get_parent_dn(current_dn)
+
+    move_required = (
+        normalize_dn(current_ou)
+        != normalize_dn(AD_DISABLED_USERS_OU)
+    )
+
+    disable_required = bool(ad_user.get("enabled"))
+    manager_clear_required = bool(ad_user.get("manager"))
+
+    ready_for_ad_write = any(
+        [
+            disable_required,
+            bool(groups_to_remove),
+            manager_clear_required,
+            move_required,
+        ]
+    )
+
     return {
-        "operation":
-            "DISABLE_AD_USER",
-
-        "employee_id":
-            employee.employee_id,
-
-        "current_ad_state":
-            ad_user,
-
-        "ready_for_ad_write":
-            True,
-
-        "ad_write_executed":
-            False,
-
-        "execution_enabled":
-            False,
+        "action": "LEAVER",
+        "operation": "DISABLE_AD_USER",
+        "employee_id": employee_id,
+        "desired_state": {
+            "enabled": False,
+            "manager": None,
+            "target_ou": AD_DISABLED_USERS_OU,
+            "managed_birthright_groups": [],
+        },
+        "current_ad_state": ad_user,
+        "group_changes": {
+            "remove": groups_to_remove,
+            "add": [],
+        },
+        "manager": {
+            "current_dn": ad_user.get("manager"),
+            "desired_dn": None,
+            "clear_required": manager_clear_required,
+        },
+        "ou_change": {
+            "current_ou": current_ou,
+            "target_ou": AD_DISABLED_USERS_OU,
+            "move_required": move_required,
+        },
+        "planned_operations": {
+            "disable_user": disable_required,
+            "remove_groups": bool(groups_to_remove),
+            "clear_manager": manager_clear_required,
+            "move_user": move_required,
+        },
+        "ready_for_ad_write": ready_for_ad_write,
+        "ad_write_executed": False,
+        "execution_enabled": True,
     }
 
 
@@ -784,20 +804,18 @@ def prepare_identity_request_for_provisioning(
             "Unable to connect to Active Directory."
         )
 
+    ad_user = get_user_by_employee_id(
+        employee.employee_id
+    )
+
     if action == "JOINER":
-        correlation = reconcile_ad_identity(
-            employee_id=employee.employee_id,
-            first_name=employee.first_name,
-            last_name=employee.last_name,
-        )
-        ad_user = correlation.get("ad_user")
+
         operation = prepare_joiner(
             employee,
-            correlation,
+            ad_user,
         )
 
     elif action == "MOVER":
-        ad_user = get_user_by_employee_id(employee.employee_id)
 
         operation = prepare_mover(
             employee,
@@ -805,7 +823,6 @@ def prepare_identity_request_for_provisioning(
         )
 
     elif action == "LEAVER":
-        ad_user = get_user_by_employee_id(employee.employee_id)
 
         operation = prepare_leaver(
             employee,
@@ -882,44 +899,56 @@ def execute_joiner(
     Execute an approved JOINER request against Active Directory.
 
     Execution flow:
-        1. Normalize/validate the approved provisioning plan
-        2. Create the user disabled OR safely resume a partial JOINER
-        3. Generate a cryptographically random temporary password
-        4. Set the password over LDAPS
-        5. Require password change at next logon
-        6. Add birthright group memberships
-        7. Enable the account
-        8. Read the account back and verify final state
+        1. Validate the employee does not already exist in AD
+        2. Create the AD user
+        3. Add birthright group memberships
+        4. Enable the AD account
+        5. Read the account back from AD
+        6. Verify the final state
 
-    The temporary password is returned ONCE to the caller and is
-    automatically redacted from AuditEvent.details.
+    This function performs actual Active Directory writes.
     """
 
     employee_id = str(employee.employee_id)
 
     # ---------------------------------------------------------
     # Normalize the provisioning plan
+    #
+    # execute_joiner() may receive either:
+    #
+    # 1. The complete preparation result:
+    #       {
+    #           "action": "JOINER",
+    #           "operation": {
+    #               "operation": "CREATE_AD_USER",
+    #               "desired_state": {...},
+    #               "identity_mapping": {...},
+    #           },
+    #       }
+    #
+    # OR
+    #
+    # 2. The operation dictionary directly:
+    #       {
+    #           "operation": "CREATE_AD_USER",
+    #           "desired_state": {...},
+    #           "identity_mapping": {...},
+    #       }
+    #
+    # Support both safely.
     # ---------------------------------------------------------
 
     if (
         isinstance(plan, dict)
-        and isinstance(
-            plan.get("desired_state"),
-            dict,
-        )
+        and isinstance(plan.get("desired_state"), dict)
     ):
         operation_data = plan
 
     elif (
         isinstance(plan, dict)
-        and isinstance(
-            plan.get("operation"),
-            dict,
-        )
+        and isinstance(plan.get("operation"), dict)
     ):
-        operation_data = plan[
-            "operation"
-        ]
+        operation_data = plan["operation"]
 
     else:
         raise ValueError(
@@ -940,45 +969,31 @@ def execute_joiner(
         "operation"
     )
 
-    if operation_name not in {"CREATE_AD_USER", "ADOPT_EXISTING_AD_USER"}:
+    if operation_name != "CREATE_AD_USER":
         raise ValueError(
-            f"JOINER {employee_id}: unsupported operation {operation_name!r}."
+            f"JOINER {employee_id}: expected CREATE_AD_USER operation, "
+            f"found {operation_name!r}."
         )
 
-    adopting_existing = operation_name == "ADOPT_EXISTING_AD_USER"
-
     # ---------------------------------------------------------
-    # Desired identity
+    # Desired identity attributes
     # ---------------------------------------------------------
 
     first_name = desired_state.get(
         "first_name"
     )
-
     last_name = desired_state.get(
         "last_name"
     )
-
     department = desired_state.get(
         "department"
     )
-
     job_title = desired_state.get(
         "job_title"
     )
-
     email = desired_state.get(
         "email"
     )
-
-    # manager_employee_id should be the HR employeeId of the supervisor.
-    # For backward compatibility, a manager value that looks like an
-    # employee ID is also accepted.
-    manager_employee_id = desired_state.get("manager_employee_id")
-    if not manager_employee_id:
-        manager_value = desired_state.get("manager")
-        if manager_value and str(manager_value).strip().isdigit():
-            manager_employee_id = str(manager_value).strip()
 
     if not first_name:
         raise ValueError(
@@ -995,111 +1010,78 @@ def execute_joiner(
             f"JOINER {employee_id}: department is required."
         )
 
+    # ---------------------------------------------------------
+    # Identity mapping
+    # ---------------------------------------------------------
+
     target_ou = identity_mapping.get(
         "target_ou"
     )
 
-    birthright_group_dns = (
-        identity_mapping.get(
-            "birthright_group_dns",
-            [],
-        )
+    birthright_group_dns = identity_mapping.get(
+        "birthright_group_dns",
+        [],
     )
 
     if not target_ou:
         raise ValueError(
-            f"JOINER {employee_id}: no target OU mapping exists "
-            f"for department '{department}'."
+            f"JOINER {employee_id}: no target OU mapping "
+            f"exists for department '{department}'."
         )
 
     # ---------------------------------------------------------
-    # firstname.lastname
+    # Generate account name
+    #
+    # Raylene Christopher
+    #       ↓
+    # raylene.christopher
     # ---------------------------------------------------------
 
     sam_account_name = (
         f"{first_name}.{last_name}"
         .strip()
         .lower()
-        .replace(" ", "")
+        .replace(
+            " ",
+            "",
+        )
     )
 
     # ---------------------------------------------------------
-    # Create, adopt, or resume
+    # Pre-check
+    #
+    # JOINER must never overwrite an existing AD identity.
     # ---------------------------------------------------------
 
-    existing_user = get_user_by_employee_id(employee_id)
+    existing_user = get_user_by_employee_id(
+        employee_id
+    )
 
-    if adopting_existing:
-        if not existing_user:
-            raise RuntimeError(
-                f"JOINER adoption failed for employee {employee_id}: "
-                "the correlated AD account can no longer be found."
-            )
-
-        sam_account_name = existing_user.get("sam_account_name") or sam_account_name
-
-        create_result = {
-            "success": True,
-            "operation": "ADOPT_EXISTING_AD_USER",
-            "employee_id": employee_id,
-            "creation_skipped": True,
-            "existing_account_preserved": True,
-            "password_preserved": True,
-            "distinguished_name": existing_user.get("distinguished_name"),
-            "sam_account_name": sam_account_name,
-        }
-
-        # Reconcile ordinary HR-controlled attributes.
-        update_ad_user(
-            employee_id=employee_id,
-            department=department,
-            job_title=job_title,
-            email=email,
-        )
-
-        current_dn = existing_user.get("distinguished_name")
-        if normalize_dn(get_parent_dn(current_dn)) != normalize_dn(target_ou):
-            move_ad_user(employee_id=employee_id, target_ou=target_ou)
-
-    elif existing_user:
-        existing_sam = existing_user.get("sam_account_name") or ""
-
-        if existing_sam.lower() != sam_account_name.lower():
-            raise RuntimeError(
-                f"JOINER recovery refused for employee {employee_id}. "
-                f"Expected account '{sam_account_name}', but AD contains "
-                f"'{existing_sam}'. Manual review is required."
-            )
-
-        if existing_user.get("enabled"):
-            raise RuntimeError(
-                f"JOINER recovery refused for employee {employee_id}. "
-                "Existing account is enabled; manual review is required."
-            )
-
-        create_result = {
-            "success": True,
-            "operation": "CREATE_AD_USER",
-            "employee_id": employee_id,
-            "resumed_partial_joiner": True,
-            "creation_skipped": True,
-            "distinguished_name": existing_user.get("distinguished_name"),
-            "sam_account_name": existing_sam,
-        }
-    else:
-        create_result = create_ad_user(
-            employee_id=employee_id,
-            first_name=first_name,
-            last_name=last_name,
-            department=department,
-            job_title=job_title,
-            email=email,
-            target_ou=target_ou,
-            sam_account_name=sam_account_name,
+    if existing_user:
+        raise RuntimeError(
+            f"JOINER execution refused. "
+            f"Employee {employee_id} already exists in "
+            f"Active Directory as "
+            f"{existing_user.get('distinguished_name')}."
         )
 
     # ---------------------------------------------------------
-    # Verify user exists
+    # CREATE AD USER
+    # ---------------------------------------------------------
+
+    create_result = create_ad_user(
+        employee_id=employee_id,
+        first_name=first_name,
+        last_name=last_name,
+        department=department,
+        job_title=job_title,
+        email=email,
+        target_ou=target_ou,
+        sam_account_name=sam_account_name,
+    )
+
+    # ---------------------------------------------------------
+    # Verify account exists before continuing
     # ---------------------------------------------------------
 
     created_user = get_user_by_employee_id(
@@ -1108,28 +1090,8 @@ def execute_joiner(
 
     if not created_user:
         raise RuntimeError(
-            f"JOINER verification failed after account creation/recovery. "
+            f"JOINER verification failed after account creation. "
             f"Employee {employee_id} cannot be found in AD."
-        )
-
-    # ---------------------------------------------------------
-    # Password handling
-    # ---------------------------------------------------------
-
-    temporary_password = None
-    password_result = None
-    password_change_result = None
-
-    if not adopting_existing:
-        temporary_password = generate_temporary_password()
-
-        password_result = set_ad_password(
-            employee_id=employee_id,
-            password=temporary_password,
-        )
-
-        password_change_result = require_password_change_at_next_logon(
-            employee_id=employee_id,
         )
 
     # ---------------------------------------------------------
@@ -1149,51 +1111,23 @@ def execute_joiner(
         )
 
     # ---------------------------------------------------------
-    # Enable account only after password + groups succeed
+    # Enable account
+    #
+    # create_ad_user() intentionally creates the account
+    # disabled. Enablement occurs only after successful creation
+    # and birthright assignment.
     # ---------------------------------------------------------
 
-    if adopting_existing:
-        enable_result = {
-            "success": True,
-            "changed": False,
-            "preserved_existing_state": True,
-            "enabled": created_user.get("enabled"),
-        }
-    else:
-        enable_result = enable_ad_user(
-            employee_id=employee_id
-        )
+    enable_result = enable_ad_user(
+        employee_id=employee_id
+    )
 
     # ---------------------------------------------------------
-    # Manager assignment
+    # Final AD verification
     # ---------------------------------------------------------
 
-    manager_result = None
-    if manager_employee_id:
-        manager_ad_user = get_user_by_employee_id(str(manager_employee_id))
-        if manager_ad_user:
-            manager_result = set_ad_manager(
-                employee_id=employee_id,
-                manager_employee_id=str(manager_employee_id),
-            )
-        else:
-            # Do not fail a valid JOINER only because the supervisor has not
-            # been provisioned yet. A later synchronization can apply it.
-            manager_result = {
-                "success": False,
-                "deferred": True,
-                "manager_employee_id": str(manager_employee_id),
-                "message": "Manager is not yet present in Active Directory; assignment deferred.",
-            }
-
-    # ---------------------------------------------------------
-    # Final verification
-    # ---------------------------------------------------------
-
-    verified_ad_state = (
-        get_user_by_employee_id(
-            employee_id
-        )
+    verified_ad_state = get_user_by_employee_id(
+        employee_id
     )
 
     if not verified_ad_state:
@@ -1201,6 +1135,10 @@ def execute_joiner(
             f"JOINER final verification failed. "
             f"Employee {employee_id} cannot be found in AD."
         )
+
+    # ---------------------------------------------------------
+    # Verify target OU
+    # ---------------------------------------------------------
 
     final_dn = (
         verified_ad_state.get(
@@ -1214,43 +1152,44 @@ def execute_joiner(
         not in normalize_dn(final_dn)
     ):
         raise RuntimeError(
-            f"JOINER OU verification failed for employee {employee_id}. "
-            f"Expected OU '{target_ou}', found DN '{final_dn}'."
+            f"JOINER OU verification failed for "
+            f"employee {employee_id}. "
+            f"Expected OU '{target_ou}', "
+            f"found DN '{final_dn}'."
         )
+
+    # ---------------------------------------------------------
+    # Verify birthright groups
+    # ---------------------------------------------------------
 
     final_groups = {
         normalize_dn(group)
-        for group in (
-            verified_ad_state.get(
-                "groups",
-                [],
-            )
+        for group in verified_ad_state.get(
+            "groups",
+            [],
         )
     }
 
     missing_groups = [
         group_dn
-        for group_dn
-        in birthright_group_dns
-        if (
-            normalize_dn(group_dn)
-            not in final_groups
-        )
+        for group_dn in birthright_group_dns
+        if normalize_dn(group_dn) not in final_groups
     ]
 
     if missing_groups:
         raise RuntimeError(
-            f"JOINER group verification failed for employee "
-            f"{employee_id}. Missing groups: {missing_groups}"
+            f"JOINER group verification failed for "
+            f"employee {employee_id}. "
+            f"Missing groups: {missing_groups}"
         )
 
-    if (
-        not adopting_existing
-        and verified_ad_state.get(
-            "enabled"
-        )
-        is not True
-    ):
+    # ---------------------------------------------------------
+    # Verify account enabled
+    # ---------------------------------------------------------
+
+    if verified_ad_state.get(
+        "enabled"
+    ) is not True:
         raise RuntimeError(
             f"JOINER enablement verification failed for "
             f"employee {employee_id}."
@@ -1263,32 +1202,11 @@ def execute_joiner(
         "sam_account_name":
             sam_account_name,
 
-        "user_principal_name":
-            verified_ad_state.get(
-                "user_principal_name"
-            ),
-
-        # IMPORTANT:
-        # This secret is intended to be shown once to the authorized
-        # operator/secure-delivery service. create_audit_event()
-        # redacts it before persistence.
-        "temporary_password":
-            temporary_password,
-
-        "must_change_password_at_next_logon":
-            (not adopting_existing),
-
         "target_ou":
             target_ou,
 
         "create_user":
             create_result,
-
-        "password_set":
-            password_result,
-
-        "password_change_required":
-            password_change_result,
 
         "groups_added":
             groups_added,
@@ -1301,8 +1219,6 @@ def execute_joiner(
 
         "success":
             True,
-        "adopted_existing_account": adopting_existing,
-        "manager_result": manager_result,
     }
 
 
@@ -1464,6 +1380,118 @@ def execute_mover(
 
 
 # ============================================================
+# LEAVER Execution
+# ============================================================
+
+def execute_leaver(
+    employee: Employee,
+    plan: dict,
+) -> dict:
+    """
+    Execute an approved, prepared LEAVER against Active Directory.
+
+    Execution order:
+        1. Disable account
+        2. Remove IAM-managed birthright groups
+        3. Clear manager
+        4. Move user to Disabled Users OU
+        5. Read AD again and verify final state
+    """
+
+    employee_id = str(employee.employee_id)
+    planned = plan.get("planned_operations", {})
+
+    results = {
+        "disable_user": None,
+        "groups_removed": [],
+        "manager_clear": None,
+        "ou_move": None,
+    }
+
+    if planned.get("disable_user"):
+        results["disable_user"] = disable_ad_user(
+            employee_id=employee_id
+        )
+
+    for group_dn in plan.get("group_changes", {}).get("remove", []):
+        result = remove_user_from_group(
+            employee_id=employee_id,
+            group_dn=group_dn,
+        )
+        results["groups_removed"].append(result)
+
+    if planned.get("clear_manager"):
+        results["manager_clear"] = set_ad_manager(
+            employee_id=employee_id,
+            manager_employee_id=None,
+        )
+
+    target_ou = plan.get("ou_change", {}).get("target_ou")
+    if planned.get("move_user"):
+        results["ou_move"] = move_ad_user(
+            employee_id=employee_id,
+            target_ou=target_ou,
+        )
+
+    verified_state = get_user_by_employee_id(employee_id)
+
+    if not verified_state:
+        raise RuntimeError(
+            "LEAVER completed but the AD account could not be retrieved."
+        )
+
+    if verified_state.get("enabled") is not False:
+        raise RuntimeError(
+            "LEAVER verification failed: account is still enabled."
+        )
+
+    verified_dn = verified_state.get("distinguished_name")
+    verified_ou = get_parent_dn(verified_dn)
+
+    if (
+        target_ou
+        and normalize_dn(verified_ou) != normalize_dn(target_ou)
+    ):
+        raise RuntimeError(
+            "LEAVER OU verification failed. "
+            f"Expected: {target_ou}; Actual: {verified_ou}"
+        )
+
+    if (
+        plan.get("manager", {}).get("clear_required")
+        and verified_state.get("manager")
+    ):
+        raise RuntimeError(
+            "LEAVER manager verification failed. "
+            f"Manager still set to: {verified_state.get('manager')}"
+        )
+
+    remaining_groups = {
+        normalize_dn(group_dn)
+        for group_dn in verified_state.get("groups", [])
+    }
+
+    expected_removed_groups = (
+        plan.get("group_changes", {}).get("remove", [])
+    )
+
+    groups_still_present = [
+        group_dn
+        for group_dn in expected_removed_groups
+        if normalize_dn(group_dn) in remaining_groups
+    ]
+
+    if groups_still_present:
+        raise RuntimeError(
+            "LEAVER group verification failed. "
+            f"Groups still present: {groups_still_present}"
+        )
+
+    results["verified_ad_state"] = verified_state
+    return results
+
+
+# ============================================================
 # Execute Approved Identity Request
 # ============================================================
 
@@ -1478,7 +1506,7 @@ def execute_identity_request(
 
         JOINER = enabled
         MOVER  = enabled
-        LEAVER = preparation only
+        LEAVER = enabled
 
     Request lifecycle:
 
@@ -1522,11 +1550,12 @@ def execute_identity_request(
     if action not in {
         "JOINER",
         "MOVER",
+        "LEAVER",
     }:
         raise ValueError(
             (
-                f"{action} execution is not enabled yet. "
-                "JOINER and MOVER are currently enabled."
+                f"{action} execution is not enabled. "
+                "JOINER, MOVER, and LEAVER are currently enabled."
             )
         )
 
@@ -1534,24 +1563,24 @@ def execute_identity_request(
     # Prepare exact plan
     # ========================================================
 
-    if action == "JOINER":
-        correlation = reconcile_ad_identity(
-            employee_id=employee.employee_id,
-            first_name=employee.first_name,
-            last_name=employee.last_name,
-        )
+    ad_user = get_user_by_employee_id(
+        employee.employee_id
+    )
 
+    if action == "JOINER":
         plan = prepare_joiner(
             employee=employee,
-            correlation=correlation,
+            ad_user=ad_user,
         )
 
     elif action == "MOVER":
-        ad_user = get_user_by_employee_id(
-            employee.employee_id
+        plan = prepare_mover(
+            employee=employee,
+            ad_user=ad_user,
         )
 
-        plan = prepare_mover(
+    elif action == "LEAVER":
+        plan = prepare_leaver(
             employee=employee,
             ad_user=ad_user,
         )
@@ -1561,9 +1590,61 @@ def execute_identity_request(
             f"Unsupported execution action: {action}"
         )
 
-    if not plan[
-        "ready_for_ad_write"
-    ]:
+    if not plan["ready_for_ad_write"]:
+        # LEAVER recovery / idempotent reconciliation.
+        #
+        # This handles the case where a previous LEAVER execution
+        # successfully modified Active Directory but the request was
+        # subsequently marked Failed because another step failed.
+        #
+        # If AD already satisfies the complete LEAVER state, do not
+        # attempt destructive operations again. Reconcile the
+        # approved/previously-failed request as Completed instead.
+        if action == "LEAVER":
+            request.status = "Completed"
+            request.completed_at = datetime.utcnow()
+
+            create_audit_event(
+                db=db,
+                request=request,
+                event_type="PROVISIONING_RECONCILED",
+                result="SUCCESS",
+                details={
+                    "action": action,
+                    "approved_by": request.approved_by,
+                    "reason": (
+                        "No additional Active Directory changes were required. "
+                        "The account already satisfies the requested LEAVER state."
+                    ),
+                    "plan": plan,
+                    "ad_write_executed": False,
+                },
+            )
+
+            db.commit()
+            db.refresh(request)
+
+            return {
+                "status": "success",
+                "message": f"{action} request reconciled successfully",
+                "request_id": request.request_id,
+                "employee_id": employee.employee_id,
+                "action": action,
+                "request_status": request.status,
+                "approved_by": request.approved_by,
+                "completed_at": request.completed_at,
+                "ad_write_executed": False,
+                "reconciled": True,
+                "execution_result": {
+                    "message": (
+                        "Active Directory already satisfies the requested LEAVER state."
+                    ),
+                    "current_ad_state": plan.get("current_ad_state"),
+                    "planned_operations": plan.get("planned_operations"),
+                },
+            }
+
+        # Preserve existing JOINER / MOVER behavior.
         raise ValueError(
             (
                 "No Active Directory changes "
@@ -1623,6 +1704,12 @@ def execute_identity_request(
 
         elif action == "MOVER":
             execution_result = execute_mover(
+                employee=employee,
+                plan=plan,
+            )
+
+        elif action == "LEAVER":
+            execution_result = execute_leaver(
                 employee=employee,
                 plan=plan,
             )
