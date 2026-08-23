@@ -17,6 +17,7 @@ from app.services.ad_service import (
     create_ad_user,
     update_ad_user,
     enable_ad_user,
+    disable_ad_user,
     move_ad_user,
     add_user_to_group,
     remove_user_from_group,
@@ -24,6 +25,7 @@ from app.services.ad_service import (
     generate_temporary_password,
     set_ad_password,
     require_password_change_at_next_logon,
+    AD_DISABLED_USERS_OU,
 )
 
 from app.config.identity_mapping import (
@@ -495,6 +497,68 @@ def prepare_joiner(
         recovering_partial_joiner = True
 
     # ========================================================
+    # Manager resolution
+    # ========================================================
+
+    manager_employee_id = getattr(
+        employee,
+        "manager_employee_id",
+        None,
+    )
+
+    if manager_employee_id is not None:
+        manager_employee_id = (
+            str(manager_employee_id).strip()
+            or None
+        )
+
+    desired_manager_dn = None
+
+    if manager_employee_id:
+        if manager_employee_id == employee_id:
+            raise ValueError(
+                f"Employee {employee_id} cannot be "
+                "assigned as their own manager."
+            )
+
+        manager_ad_user = (
+            get_user_by_employee_id(
+                manager_employee_id
+            )
+        )
+
+        if not manager_ad_user:
+            raise ValueError(
+                f"Manager employee "
+                f"{manager_employee_id} does not "
+                "exist in Active Directory."
+            )
+
+        desired_manager_dn = (
+            manager_ad_user.get(
+                "distinguished_name"
+            )
+        )
+
+        if not desired_manager_dn:
+            raise RuntimeError(
+                f"Manager employee "
+                f"{manager_employee_id} does not "
+                "have a distinguished name."
+            )
+
+    current_manager_dn = (
+        ad_user.get("manager")
+        if ad_user
+        else None
+    )
+
+    manager_assignment_required = (
+        normalize_dn(current_manager_dn)
+        != normalize_dn(desired_manager_dn)
+    )
+
+    # ========================================================
     # Provisioning plan
     # ========================================================
 
@@ -521,6 +585,20 @@ def prepare_joiner(
                 mapping["group_dns"],
         },
 
+        "manager_change": {
+            "old":
+                current_manager_dn,
+
+            "new":
+                desired_manager_dn,
+
+            "manager_employee_id":
+                manager_employee_id,
+
+            "assignment_required":
+                manager_assignment_required,
+        },
+
         "recovery": {
             "partial_joiner":
                 recovering_partial_joiner,
@@ -540,6 +618,7 @@ def prepare_joiner(
         "execution_enabled":
             True,
     }
+
 
 
 
@@ -686,6 +765,14 @@ def prepare_mover(
             "manager_employee_id": manager_employee_id,
         }
 
+    # Keep manager changes separate from standard
+    # user-attribute changes.
+    standard_attribute_changes = {
+        key: value
+        for key, value in changes.items()
+        if key != "manager"
+    }
+
     current_dn = ad_user.get(
         "distinguished_name"
     )
@@ -764,6 +851,9 @@ def prepare_mover(
         "attribute_changes":
             changes,
 
+        "standard_attribute_changes":
+            standard_attribute_changes,
+
         "attribute_change_count":
             len(changes),
 
@@ -783,7 +873,7 @@ def prepare_mover(
 
         "planned_operations": {
             "update_attributes":
-                bool(changes),
+                bool(standard_attribute_changes),
             "update_manager":
                 "manager" in changes,
 
@@ -813,48 +903,84 @@ def prepare_mover(
     }
 
 
+
 # ============================================================
 # LEAVER Preparation
 # ============================================================
+
 
 def prepare_leaver(
     employee: Employee,
     ad_user: dict | None,
 ) -> dict:
     """
-    Prepare LEAVER operation.
+    Calculate the exact idempotent LEAVER changes.
 
-    LEAVER execution is intentionally not enabled yet.
+    Desired final state:
+    - account disabled
+    - direct group memberships removed
+    - manager cleared
+    - account moved to Disabled Users OU
     """
 
     if not ad_user:
-
         raise ValueError(
-            (
-                f"Employee {employee.employee_id} "
-                "does not exist in Active Directory."
-            )
+            f"Employee {employee.employee_id} "
+            "does not exist in Active Directory."
         )
 
+    if not AD_DISABLED_USERS_OU:
+        raise ValueError(
+            "AD_DISABLED_USERS_OU is not configured."
+        )
+
+    current_dn = ad_user.get("distinguished_name")
+    current_ou = get_parent_dn(current_dn)
+
+    groups_to_remove = list(
+        ad_user.get("groups") or []
+    )
+
+    disable_required = (
+        ad_user.get("enabled") is True
+    )
+
+    clear_manager_required = bool(
+        ad_user.get("manager")
+    )
+
+    move_required = (
+        normalize_dn(current_ou)
+        != normalize_dn(AD_DISABLED_USERS_OU)
+    )
+
+    ready_for_ad_write = any(
+        [
+            disable_required,
+            bool(groups_to_remove),
+            clear_manager_required,
+            move_required,
+        ]
+    )
+
     return {
-        "operation":
-            "DISABLE_AD_USER",
-
-        "employee_id":
-            employee.employee_id,
-
-        "current_ad_state":
-            ad_user,
-
-        "ready_for_ad_write":
-            True,
-
-        "ad_write_executed":
-            False,
-
-        "execution_enabled":
-            False,
+        "operation": "DISABLE_AD_USER",
+        "employee_id": employee.employee_id,
+        "current_ad_state": ad_user,
+        "groups_to_remove": groups_to_remove,
+        "clear_manager": clear_manager_required,
+        "target_ou": AD_DISABLED_USERS_OU,
+        "planned_operations": {
+            "disable_account": disable_required,
+            "remove_groups": bool(groups_to_remove),
+            "clear_manager": clear_manager_required,
+            "move_user": move_required,
+        },
+        "ready_for_ad_write": ready_for_ad_write,
+        "ad_write_executed": False,
+        "execution_enabled": True,
     }
+
 
 
 # ============================================================
@@ -1240,6 +1366,29 @@ def execute_joiner(
         )
 
     # ========================================================
+    # Manager assignment
+    # ========================================================
+
+    manager_change = operation_data.get(
+        "manager_change",
+        {},
+    )
+
+    manager_result = None
+
+    if manager_change.get(
+        "assignment_required"
+    ):
+        manager_result = set_ad_manager(
+            employee_id=employee_id,
+            manager_employee_id=(
+                manager_change.get(
+                    "manager_employee_id"
+                )
+            ),
+        )
+
+    # ========================================================
     # Temporary password provisioning
     # ========================================================
 
@@ -1327,6 +1476,25 @@ def execute_joiner(
             f"Missing groups: {missing_groups}"
         )
 
+    expected_manager_dn = (
+        manager_change.get("new")
+    )
+
+    actual_manager_dn = (
+        verified_ad_state.get("manager")
+    )
+
+    if (
+        normalize_dn(actual_manager_dn)
+        != normalize_dn(expected_manager_dn)
+    ):
+        raise RuntimeError(
+            f"JOINER manager verification failed "
+            f"for employee {employee_id}. "
+            f"Expected: {expected_manager_dn}; "
+            f"actual: {actual_manager_dn}"
+        )
+
     # ========================================================
     # Return non-secret execution metadata
     #
@@ -1347,6 +1515,9 @@ def execute_joiner(
             groups_added,
         "groups_already_present":
             groups_already_present,
+        "manager_update":
+            manager_result,
+
         "password_set":
             bool(password_result),
         "password_change_required":
@@ -1356,6 +1527,7 @@ def execute_joiner(
         "verified_ad_state":
             verified_ad_state,
     }
+
 
 
 
@@ -1393,6 +1565,9 @@ def execute_mover(
 
         "groups_added":
             [],
+
+        "manager_update":
+            None,
     }
 
     planned = plan[
@@ -1406,14 +1581,43 @@ def execute_mover(
     if planned.get(
         "update_attributes"
     ):
+        standard_changes = plan.get(
+            "standard_attribute_changes",
+            {},
+        )
+
+        department_value = (
+            standard_changes["department"].get("new")
+            if "department" in standard_changes
+            else None
+        )
+
+        job_title_value = (
+            standard_changes["job_title"].get("new")
+            if "job_title" in standard_changes
+            else None
+        )
+
+        email_value = (
+            standard_changes["email"].get("new")
+            if "email" in standard_changes
+            else None
+        )
+
+        # Empty string clears an existing AD mail value.
+        if (
+            "email" in standard_changes
+            and email_value is None
+        ):
+            email_value = ""
 
         results[
             "attribute_update"
         ] = update_ad_user(
             employee_id=employee_id,
-            department=employee.department,
-            job_title=employee.job_title,
-            email=employee.email,
+            department=department_value,
+            job_title=job_title_value,
+            email=email_value,
         )
 
     # ========================================================
@@ -1437,18 +1641,17 @@ def execute_mover(
             ),
         )
 
+    target_ou = (
+        plan[
+            "identity_mapping"
+        ][
+            "target_ou"
+        ]
+    )
+
     if planned.get(
         "move_user"
     ):
-
-        target_ou = (
-            plan[
-                "identity_mapping"
-            ][
-                "target_ou"
-            ]
-        )
-
         results[
             "ou_move"
         ] = move_ad_user(
@@ -1536,6 +1739,95 @@ def execute_mover(
             f"Actual: {verified_state.get('manager')}"
         )
 
+    attribute_key_mapping = {
+        "department": "department",
+        "job_title": "title",
+        "email": "email",
+    }
+
+    for change_name, change in plan.get(
+        "standard_attribute_changes",
+        {},
+    ).items():
+        ad_key = attribute_key_mapping[
+            change_name
+        ]
+
+        expected_value = change.get("new")
+        actual_value = verified_state.get(ad_key)
+
+        normalized_expected = (
+            ""
+            if expected_value is None
+            else str(expected_value).strip()
+        )
+
+        normalized_actual = (
+            ""
+            if actual_value is None
+            else str(actual_value).strip()
+        )
+
+        if normalized_actual != normalized_expected:
+            raise RuntimeError(
+                f"MOVER {change_name} verification "
+                f"failed. Expected: {expected_value}; "
+                f"actual: {actual_value}"
+            )
+
+    verified_ou = get_parent_dn(
+        verified_state.get(
+            "distinguished_name"
+        )
+    )
+
+    if (
+        normalize_dn(verified_ou)
+        != normalize_dn(target_ou)
+    ):
+        raise RuntimeError(
+            "MOVER OU verification failed. "
+            f"Expected: {target_ou}; "
+            f"actual: {verified_ou}"
+        )
+
+    verified_groups = {
+        normalize_dn(group_dn)
+        for group_dn in (
+            verified_state.get("groups")
+            or []
+        )
+    }
+
+    missing_groups = [
+        group_dn
+        for group_dn in plan[
+            "identity_mapping"
+        ][
+            "birthright_group_dns"
+        ]
+        if normalize_dn(group_dn)
+        not in verified_groups
+    ]
+
+    obsolete_groups = [
+        group_dn
+        for group_dn in plan[
+            "group_changes"
+        ][
+            "remove"
+        ]
+        if normalize_dn(group_dn)
+        in verified_groups
+    ]
+
+    if missing_groups or obsolete_groups:
+        raise RuntimeError(
+            "MOVER group verification failed. "
+            f"Missing groups: {missing_groups}; "
+            f"obsolete groups: {obsolete_groups}"
+        )
+
     results[
         "verified_ad_state"
     ] = verified_state
@@ -1543,9 +1835,132 @@ def execute_mover(
     return results
 
 
+
 # ============================================================
 # Execute Approved Identity Request
 # ============================================================
+
+# ============================================================
+# LEAVER Execution
+# ============================================================
+
+def execute_leaver(
+    employee: Employee,
+    plan: dict,
+) -> dict:
+    """
+    Execute and verify an idempotent LEAVER operation.
+
+    Order:
+    1. Disable account
+    2. Remove direct groups
+    3. Clear manager
+    4. Move to Disabled Users
+    5. Verify final AD state
+    """
+
+    employee_id = str(employee.employee_id).strip()
+    planned = plan.get("planned_operations", {})
+    target_ou = plan.get("target_ou")
+
+    if not target_ou:
+        raise ValueError(
+            f"LEAVER {employee_id}: target OU is missing."
+        )
+
+    results = {
+        "success": True,
+        "employee_id": employee_id,
+        "account_disablement": None,
+        "groups_removed": [],
+        "manager_clear": None,
+        "ou_move": None,
+    }
+
+    # Disable first to contain access immediately.
+    if planned.get("disable_account"):
+        results["account_disablement"] = (
+            disable_ad_user(
+                employee_id=employee_id,
+            )
+        )
+
+    for group_dn in plan.get(
+        "groups_to_remove",
+        [],
+    ):
+        result = remove_user_from_group(
+            employee_id=employee_id,
+            group_dn=group_dn,
+        )
+
+        results["groups_removed"].append(result)
+
+    if planned.get("clear_manager"):
+        results["manager_clear"] = (
+            set_ad_manager(
+                employee_id=employee_id,
+                manager_employee_id=None,
+            )
+        )
+
+    if planned.get("move_user"):
+        results["ou_move"] = move_ad_user(
+            employee_id=employee_id,
+            target_ou=target_ou,
+        )
+
+    verified_state = get_user_by_employee_id(
+        employee_id
+    )
+
+    if not verified_state:
+        raise RuntimeError(
+            f"LEAVER verification failed. Employee "
+            f"{employee_id} cannot be found in AD."
+        )
+
+    if verified_state.get("enabled") is not False:
+        raise RuntimeError(
+            f"LEAVER verification failed for "
+            f"{employee_id}: account is still enabled."
+        )
+
+    if verified_state.get("manager"):
+        raise RuntimeError(
+            f"LEAVER verification failed for "
+            f"{employee_id}: manager was not cleared."
+        )
+
+    remaining_groups = list(
+        verified_state.get("groups") or []
+    )
+
+    if remaining_groups:
+        raise RuntimeError(
+            f"LEAVER verification failed for "
+            f"{employee_id}: groups remain: "
+            f"{remaining_groups}"
+        )
+
+    verified_ou = get_parent_dn(
+        verified_state.get("distinguished_name")
+    )
+
+    if (
+        normalize_dn(verified_ou)
+        != normalize_dn(target_ou)
+    ):
+        raise RuntimeError(
+            f"LEAVER OU verification failed for "
+            f"{employee_id}. Expected: {target_ou}; "
+            f"actual: {verified_ou}"
+        )
+
+    results["verified_ad_state"] = verified_state
+
+    return results
+
 
 def execute_identity_request(
     request_id: str,
@@ -1558,7 +1973,7 @@ def execute_identity_request(
 
         JOINER = enabled
         MOVER  = enabled
-        LEAVER = preparation only
+        LEAVER = enabled
 
     Request lifecycle:
 
@@ -1602,11 +2017,12 @@ def execute_identity_request(
     if action not in {
         "JOINER",
         "MOVER",
+        "LEAVER",
     }:
         raise ValueError(
             (
-                f"{action} execution is not enabled yet. "
-                "JOINER and MOVER are currently enabled."
+                f"{action} execution is not enabled. "
+                "JOINER, MOVER, and LEAVER are enabled."
             )
         )
 
@@ -1630,19 +2046,15 @@ def execute_identity_request(
             ad_user=ad_user,
         )
 
+    elif action == "LEAVER":
+        plan = prepare_leaver(
+            employee=employee,
+            ad_user=ad_user,
+        )
+
     else:
         raise ValueError(
             f"Unsupported execution action: {action}"
-        )
-
-    if not plan[
-        "ready_for_ad_write"
-    ]:
-        raise ValueError(
-            (
-                "No Active Directory changes "
-                "are required for this request."
-            )
         )
 
     if not plan.get(
@@ -1655,6 +2067,56 @@ def execute_identity_request(
                 "in the provisioning plan."
             )
         )
+
+    # An approved request whose desired state is already
+    # satisfied is a successful idempotent completion.
+    if not plan["ready_for_ad_write"]:
+        request.status = "Completed"
+        request.completed_at = datetime.utcnow()
+
+        execution_result = {
+            "success": True,
+            "changed": False,
+            "message": (
+                "Desired Active Directory state was "
+                "already satisfied."
+            ),
+            "verified_ad_state": (
+                plan.get("current_ad_state")
+                or ad_user
+            ),
+        }
+
+        create_audit_event(
+            db=db,
+            request=request,
+            event_type="PROVISIONING_NO_CHANGE",
+            result="SUCCESS",
+            details={
+                "action": action,
+                "approved_by": request.approved_by,
+                "plan": plan,
+            },
+        )
+
+        db.commit()
+        db.refresh(request)
+
+        return {
+            "status": "success",
+            "message": (
+                f"{action} request completed; desired "
+                "AD state was already satisfied"
+            ),
+            "request_id": request.request_id,
+            "employee_id": employee.employee_id,
+            "action": action,
+            "request_status": request.status,
+            "approved_by": request.approved_by,
+            "completed_at": request.completed_at,
+            "ad_write_executed": False,
+            "execution_result": execution_result,
+        }
 
     # ========================================================
     # Mark Provisioning
@@ -1697,6 +2159,12 @@ def execute_identity_request(
 
         elif action == "MOVER":
             execution_result = execute_mover(
+                employee=employee,
+                plan=plan,
+            )
+
+        elif action == "LEAVER":
+            execution_result = execute_leaver(
                 employee=employee,
                 plan=plan,
             )

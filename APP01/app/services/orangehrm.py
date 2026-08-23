@@ -95,6 +95,12 @@ def get_employees(access_token: str) -> dict:
     response = httpx.get(
         employee_url,
         headers=headers,
+        params={
+            "limit": 100,
+            "offset": 0,
+            "model": "detailed",
+            "includeEmployees": "currentAndPast",
+        },
         timeout=30,
     )
 
