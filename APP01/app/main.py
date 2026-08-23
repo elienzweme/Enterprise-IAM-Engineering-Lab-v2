@@ -129,7 +129,7 @@ def oauth_callback(
     # Validate OAuth state
     # --------------------------------------------------------
 
-    if state and oauth_state and state != oauth_state:
+    if not state or not oauth_state or state != oauth_state:
 
         raise HTTPException(
             status_code=400,

@@ -66,7 +66,6 @@ def exchange_authorization_code(code: str) -> dict:
     print(response.status_code)
 
     print("TOKEN RESPONSE BODY:")
-    print(response.text)
 
     response.raise_for_status()
 
@@ -111,7 +110,6 @@ def get_employees(access_token: str) -> dict:
     print(response.status_code)
 
     print("EMPLOYEE API RESPONSE:")
-    print(response.text)
 
     response.raise_for_status()
 
@@ -156,7 +154,6 @@ def get_employee_job_details(
     print(response.status_code)
 
     print("JOB DETAILS RESPONSE:")
-    print(response.text)
 
     response.raise_for_status()
 
@@ -245,7 +242,6 @@ def update_employee_job_details(
     print(response.status_code)
 
     print("UPDATE JOB DETAILS RESPONSE:")
-    print(response.text)
 
     response.raise_for_status()
 
@@ -290,7 +286,6 @@ def get_employee_supervisors(
     print(response.status_code)
 
     print("SUPERVISOR API RESPONSE:")
-    print(response.text)
 
     response.raise_for_status()
 
@@ -362,7 +357,6 @@ def add_employee_supervisor(
     print(response.status_code)
 
     print("ADD SUPERVISOR RESPONSE:")
-    print(response.text)
 
     response.raise_for_status()
 
