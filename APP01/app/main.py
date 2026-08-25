@@ -2,10 +2,15 @@
 
 import secrets
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 
 from app.database import SessionLocal
+
+from app.security import (
+    ApiPrincipal,
+    require_roles,
+)
 
 from app.api.identity_requests import (
     router as identity_requests_router,
@@ -44,7 +49,7 @@ app = FastAPI(
 # ============================================================
 
 app.include_router(
-    identity_requests_router
+    identity_requests_router,
 )
 
 
@@ -205,7 +210,11 @@ def oauth_callback(
 # ============================================================
 
 @app.get("/oauth/status")
-def oauth_status():
+def oauth_status(
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.viewer")
+    ),
+):
     """
     Check whether this FastAPI process currently
     has an OrangeHRM OAuth access token.
@@ -222,7 +231,11 @@ def oauth_status():
 # ============================================================
 
 @app.get("/employees")
-def employees():
+def employees(
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.viewer")
+    ),
+):
     """
     Retrieve employees directly from OrangeHRM.
 
@@ -268,7 +281,12 @@ def employees():
 # ============================================================
 
 @app.get("/employees/{emp_number}/job-details")
-def employee_job_details(emp_number: int):
+def employee_job_details(
+    emp_number: int,
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.viewer")
+    ),
+):
     """
     Retrieve job details for a specific OrangeHRM employee.
     """
@@ -299,7 +317,12 @@ def employee_job_details(emp_number: int):
 # ============================================================
 
 @app.get("/employees/{emp_number}/supervisors")
-def employee_supervisors(emp_number: int):
+def employee_supervisors(
+    emp_number: int,
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.viewer")
+    ),
+):
     """
     Retrieve supervisors assigned to a specific OrangeHRM employee.
     """
@@ -330,7 +353,12 @@ def employee_supervisors(emp_number: int):
 # ============================================================
 
 @app.get("/employees/{emp_number}/resolved-supervisor")
-def employee_resolved_supervisor(emp_number: int):
+def employee_resolved_supervisor(
+    emp_number: int,
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.viewer")
+    ),
+):
     """Resolve an OrangeHRM supervisor to the business employeeId."""
     global oauth_token
     if not oauth_token:
@@ -351,7 +379,11 @@ def employee_resolved_supervisor(emp_number: int):
 # ============================================================
 
 @app.post("/sync/employees")
-def sync_employees():
+def sync_employees(
+    _principal: ApiPrincipal = Depends(
+        require_roles("iam.sync")
+    ),
+):
     """
     Synchronize OrangeHRM employees into the IAM database.
 

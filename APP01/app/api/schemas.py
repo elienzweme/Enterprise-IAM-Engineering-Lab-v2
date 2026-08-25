@@ -48,7 +48,7 @@ class ApprovalRequest(BaseModel):
     }
     """
 
-    approved_by: str
+    approved_by: Optional[str] = None
 
 
 # ============================================================
@@ -66,5 +66,5 @@ class RejectionRequest(BaseModel):
     }
     """
 
-    rejected_by: str
+    rejected_by: Optional[str] = None
     reason: Optional[str] = None

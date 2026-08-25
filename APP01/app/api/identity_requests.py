@@ -65,6 +65,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 
+from app.security import ApiPrincipal, require_roles
+
 from app.models.models import (
     Employee,
     IdentityRequest,
@@ -88,6 +90,11 @@ from app.services.provisioning_service import (
 router = APIRouter(
     prefix="/identity-requests",
     tags=["Identity Requests"],
+    dependencies=[
+        Depends(
+            require_roles("iam.viewer")
+        ),
+    ],
 )
 
 
@@ -417,6 +424,9 @@ def get_identity_request(
 def approve_identity_request(
     request_id: str,
     approval: ApprovalRequest,
+    principal: ApiPrincipal = Depends(
+        require_roles("iam.approver")
+    ),
     db: Session = Depends(get_db),
 ):
     """
@@ -471,18 +481,8 @@ def approve_identity_request(
     # Validate approver
     # --------------------------------------------------------
 
-    approver = (
-        approval.approved_by.strip()
-    )
-
-    if not approver:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "approved_by cannot be empty"
-            ),
-        )
+    # Actor comes from the authenticated API key; the request-body name is ignored.
+    approver = principal.subject
 
     # --------------------------------------------------------
     # Mark Approved
@@ -577,6 +577,9 @@ def approve_identity_request(
 @router.post("/{request_id}/provision")
 def provision_identity_request(
     request_id: str,
+    principal: ApiPrincipal = Depends(
+        require_roles("iam.provisioner")
+    ),
     db: Session = Depends(get_db),
 ):
     """
@@ -704,6 +707,9 @@ def provision_identity_request(
 def reject_identity_request(
     request_id: str,
     rejection: RejectionRequest,
+    principal: ApiPrincipal = Depends(
+        require_roles("iam.approver")
+    ),
     db: Session = Depends(get_db),
 ):
     """
@@ -742,18 +748,8 @@ def reject_identity_request(
     # Validate reviewer
     # --------------------------------------------------------
 
-    rejected_by = (
-        rejection.rejected_by.strip()
-    )
-
-    if not rejected_by:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "rejected_by cannot be empty"
-            ),
-        )
+    # Actor comes from the authenticated API key; the request-body name is ignored.
+    rejected_by = principal.subject
 
     reason = (
         rejection.reason.strip()
@@ -861,6 +857,9 @@ def reject_identity_request(
 @router.post("/{request_id}/retry")
 def retry_identity_request(
     request_id: str,
+    principal: ApiPrincipal = Depends(
+        require_roles("iam.provisioner")
+    ),
     db: Session = Depends(get_db),
 ):
     """

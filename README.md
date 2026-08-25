@@ -54,3 +54,21 @@ This project demonstrates enterprise IAM architecture, identity governance, dire
 - Microsoft Entra ID
 - Okta
 - Google Workspace
+
+## APP01 API Authentication and RBAC
+
+APP01 operational endpoints use API-key authentication through the `X-API-Key` header. Secret values exist only in `/opt/iam-platform/.env`, which has `0600` permissions and is excluded from Git.
+
+| Principal | Authorized responsibility |
+| --- | --- |
+| `iam.viewer` | Read employees, OAuth status, and identity requests |
+| `iam.sync` | Run OrangeHRM employee synchronization |
+| `iam.approver` | Read, approve, and reject identity requests |
+| `iam.provisioner` | Read, provision, and retry identity requests |
+| `iam.admin` | Administrative override across all roles |
+
+Approval and rejection audit identities come from the authenticated API-key principal. Client-provided `approved_by` and `rejected_by` values are not trusted as the actor identity.
+
+Security controls include constant-time key comparison, HTTP `401` for invalid credentials, HTTP `403` for insufficient roles, HTTP `503` for missing key configuration, and separation of approval and provisioning responsibilities.
+
+Validation completed successfully with `34 passed` automated tests, including API authentication, role boundaries, JML regression, retries, idempotency, and OAuth security.
