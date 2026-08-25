@@ -12,6 +12,7 @@ from app.security import (
     require_roles,
 )
 
+from app.api.credential_deliveries import router as credential_deliveries_router
 from app.api.identity_requests import (
     router as identity_requests_router,
 )
@@ -456,3 +457,5 @@ def sync_employees(
     finally:
 
         db.close()
+
+app.include_router(credential_deliveries_router)

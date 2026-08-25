@@ -96,6 +96,68 @@ class IdentityRequest(Base):
     )
 
 
+class CredentialDelivery(Base):
+    """
+    Encrypted, expiring, one-time JOINER credential delivery.
+
+    The plaintext password and usable retrieval token are never stored.
+    """
+
+    __tablename__ = "credential_deliveries"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    delivery_id: Mapped[str] = mapped_column(
+        String(50),
+        unique=True,
+        index=True,
+    )
+
+    request_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey(
+            "identity_requests.request_id",
+            ondelete="CASCADE",
+        ),
+        index=True,
+    )
+
+    employee_id: Mapped[str] = mapped_column(
+        String(50),
+        index=True,
+    )
+
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+    )
+
+    encrypted_password: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        index=True,
+    )
+
+    retrieved_at: Mapped[datetime | None] = mapped_column(
+        DateTime,
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 

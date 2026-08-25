@@ -11,6 +11,7 @@ from app.models.models import (
     AuditEvent,
 )
 
+from app.services.credential_delivery_service import create_credential_delivery
 from app.services.ad_service import (
     get_user_by_employee_id,
     test_ad_connection,
@@ -1115,6 +1116,8 @@ def prepare_identity_request_for_provisioning(
 def execute_joiner(
     employee: Employee,
     plan: dict,
+    db: Session | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """
     Execute an approved JOINER request against Active Directory.
@@ -1496,6 +1499,16 @@ def execute_joiner(
         )
 
     # ========================================================
+    credential_delivery = None
+
+    if db is not None and request_id:
+        credential_delivery = create_credential_delivery(
+            db=db,
+            request_id=request_id,
+            employee_id=employee_id,
+            plaintext_password=temporary_password,
+        )
+
     # Return non-secret execution metadata
     #
     # IMPORTANT:
@@ -1505,6 +1518,7 @@ def execute_joiner(
     # ========================================================
 
     return {
+        "_credential_delivery": credential_delivery,
         "success": True,
         "employee_id": employee_id,
         "recovered_partial_joiner":
@@ -2155,6 +2169,8 @@ def execute_identity_request(
             execution_result = execute_joiner(
                 employee=employee,
                 plan=plan,
+                db=db,
+                request_id=request.request_id,
             )
 
         elif action == "MOVER":
@@ -2175,6 +2191,13 @@ def execute_identity_request(
             )
 
         # ====================================================
+        credential_delivery = execution_result.pop(
+            "_credential_delivery",
+            None,
+        )
+
+        audit_execution_result = dict(execution_result)
+
         # Mark Completed
         # ====================================================
 
@@ -2199,9 +2222,14 @@ def execute_identity_request(
                     request.approved_by,
 
                 "execution_result":
-                    execution_result,
+                    audit_execution_result,
             },
         )
+
+        if credential_delivery is not None:
+            execution_result["credential_delivery"] = (
+                credential_delivery
+            )
 
         db.commit()
 
