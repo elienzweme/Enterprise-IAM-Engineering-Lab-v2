@@ -1,0 +1,18 @@
+[Unit]
+Description=Enterprise IAM Platform FastAPI Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iamadmin
+Group=iamadmin
+WorkingDirectory=/opt/iam-platform
+EnvironmentFile=/opt/iam-platform/.env
+ExecStart=/opt/iam-platform/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
