@@ -16,3 +16,13 @@
 *.p12
 *.pfx
 **/*.before-*
+**/*.py[cod]
+**/*.log
+**/*.bak
+**/*.backup-*
+**/*.db
+**/*.sqlite*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx

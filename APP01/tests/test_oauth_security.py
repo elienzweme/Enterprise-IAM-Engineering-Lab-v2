@@ -96,8 +96,15 @@ def test_valid_oauth_callback_returns_no_token(mocker):
 
 
 def test_orangehrm_source_does_not_log_http_responses():
-    source = Path(
-        "app/services/orangehrm.py"
+    project_root = (
+        Path(__file__).resolve().parents[1]
+    )
+
+    source = (
+        project_root
+        / "app"
+        / "services"
+        / "orangehrm.py"
     ).read_text()
 
     unsafe_logging = re.search(

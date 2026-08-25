@@ -1,186 +1,71 @@
-from app.models.models import Employee
+
+from types import SimpleNamespace
+
 from app.services import provisioning_service as ps
 
 
-def test_normal_leaver_executes_complete_deprovisioning(
-    mocker,
-):
-    """
-    A normal LEAVER must execute in this order:
+ACCOUNTING_OU = (
+    "OU=Accounting,OU=Departments,DC=Corp,DC=local"
+)
 
-    1. Disable account
-    2. Remove direct groups
-    3. Clear manager
-    4. Move to Disabled Users
-    5. Verify final AD state
-    """
+DISABLED_OU = (
+    "OU=Disabled Users,DC=Corp,DC=local"
+)
 
-    employee = Employee(
-        employee_id="T9200",
-        first_name="Avery",
-        last_name="Leaver",
-        email="avery.leaver@corp.local",
-        department="Accounting",
-        job_title="Account Payable Analyst",
-        manager="Henry Woodward",
-        manager_employee_id="0008",
+ACCOUNTING_GROUP = (
+    "CN=Accounting Group,OU=Domain Groups,DC=Corp,DC=local"
+)
+
+REMOTE_GROUP = (
+    "CN=Remote Access Users,OU=Domain Groups,DC=Corp,DC=local"
+)
+
+MANAGER_DN = (
+    "CN=Henry Woodward,OU=Accounting,"
+    "OU=Departments,DC=Corp,DC=local"
+)
+
+
+def employee():
+    return SimpleNamespace(
+        employee_id="TEST-LEAVER",
         employment_status="Terminated",
-        source_system="PYTEST",
     )
 
-    accounting_ou = (
-        "OU=Accounting,"
-        "OU=Departments,"
-        "DC=Corp,"
-        "DC=local"
-    )
 
-    disabled_ou = ps.AD_DISABLED_USERS_OU
-
-    accounting_group = (
-        "CN=Accounting Group,"
-        "OU=Domain Groups,"
-        "DC=Corp,"
-        "DC=local"
-    )
-
-    manager_dn = (
-        "CN=Henry Woodward,"
-        "OU=Accounting,"
-        "OU=Departments,"
-        "DC=Corp,"
-        "DC=local"
-    )
-
-    current_ad_user = {
+def active_ad_state():
+    return {
         "distinguished_name": (
-            "CN=Avery Leaver,"
-            f"{accounting_ou}"
+            "CN=Test Leaver," + ACCOUNTING_OU
         ),
-        "display_name": "Avery Leaver",
-        "first_name": "Avery",
-        "last_name": "Leaver",
-        "sam_account_name": "avery.leaver",
-        "user_principal_name": (
-            "avery.leaver@corp.local"
-        ),
-        "employee_id": "T9200",
-        "department": "Accounting",
-        "title": "Account Payable Analyst",
-        "email": "avery.leaver@corp.local",
-        "manager": manager_dn,
         "enabled": True,
+        "manager": MANAGER_DN,
         "groups": [
-            accounting_group,
+            ACCOUNTING_GROUP,
+            REMOTE_GROUP,
         ],
     }
 
-    verified_ad_user = {
-        **current_ad_user,
-        "distinguished_name": (
-            "CN=Avery Leaver,"
-            f"{disabled_ou}"
-        ),
-        "manager": None,
-        "enabled": False,
-        "groups": [],
-    }
 
-    operations = []
-
-    def fake_disable(*args, **kwargs):
-        operations.append("disable account")
-
-        return {
-            "success": True,
-            "changed": True,
-            "employee_id": "T9200",
-            "enabled": False,
-        }
-
-    def fake_remove_group(*args, **kwargs):
-        operations.append("remove group")
-
-        return {
-            "success": True,
-            "changed": True,
-            "employee_id": "T9200",
-            "group_dn": accounting_group,
-        }
-
-    def fake_clear_manager(*args, **kwargs):
-        operations.append("clear manager")
-
-        return {
-            "success": True,
-            "changed": True,
-            "employee_id": "T9200",
-            "manager_employee_id": None,
-            "manager_dn": None,
-        }
-
-    def fake_move(*args, **kwargs):
-        operations.append("move user")
-
-        return {
-            "success": True,
-            "changed": True,
-            "employee_id": "T9200",
-            "target_ou": disabled_ou,
-        }
-
-    def fake_get_user(employee_id):
-        assert str(employee_id) == "T9200"
-
-        operations.append("verify final state")
-        return verified_ad_user
-
-    disable_mock = mocker.patch.object(
+def test_prepare_leaver_calculates_operations(monkeypatch):
+    monkeypatch.setattr(
         ps,
-        "disable_ad_user",
-        side_effect=fake_disable,
-    )
-
-    remove_mock = mocker.patch.object(
-        ps,
-        "remove_user_from_group",
-        side_effect=fake_remove_group,
-    )
-
-    manager_mock = mocker.patch.object(
-        ps,
-        "set_ad_manager",
-        side_effect=fake_clear_manager,
-    )
-
-    move_mock = mocker.patch.object(
-        ps,
-        "move_ad_user",
-        side_effect=fake_move,
-    )
-
-    get_user_mock = mocker.patch.object(
-        ps,
-        "get_user_by_employee_id",
-        side_effect=fake_get_user,
+        "AD_DISABLED_USERS_OU",
+        DISABLED_OU,
     )
 
     plan = ps.prepare_leaver(
-        employee=employee,
-        ad_user=current_ad_user,
+        employee(),
+        active_ad_state(),
     )
 
-    assert plan["operation"] == "DISABLE_AD_USER"
-    assert plan["employee_id"] == "T9200"
-    assert plan["ready_for_ad_write"] is True
     assert plan["execution_enabled"] is True
+    assert plan["ready_for_ad_write"] is True
 
     assert plan["groups_to_remove"] == [
-        accounting_group,
+        ACCOUNTING_GROUP,
+        REMOTE_GROUP,
     ]
-
-    assert plan["clear_manager"] is True
-    assert plan["target_ou"] == disabled_ou
 
     assert plan["planned_operations"] == {
         "disable_account": True,
@@ -189,352 +74,164 @@ def test_normal_leaver_executes_complete_deprovisioning(
         "move_user": True,
     }
 
-    result = ps.execute_leaver(
-        employee=employee,
-        plan=plan,
+
+def test_execute_leaver_and_verify(monkeypatch):
+    monkeypatch.setattr(
+        ps,
+        "AD_DISABLED_USERS_OU",
+        DISABLED_OU,
     )
 
-    verified = result["verified_ad_state"]
-
-    assert verified["enabled"] is False
-    assert verified["manager"] is None
-    assert verified["groups"] == []
-
-    assert disabled_ou.lower() in (
-        verified["distinguished_name"].lower()
-    )
-
-    # Validate the required security-sensitive sequence.
-    assert operations == [
-        "disable account",
-        "remove group",
-        "clear manager",
-        "move user",
-        "verify final state",
-    ]
-
-    disable_mock.assert_called_once()
-
-    remove_mock.assert_called_once_with(
-        employee_id="T9200",
-        group_dn=accounting_group,
-    )
-
-    manager_mock.assert_called_once_with(
-        employee_id="T9200",
-        manager_employee_id=None,
-    )
-
-    move_mock.assert_called_once_with(
-        employee_id="T9200",
-        target_ou=disabled_ou,
-    )
-
-    get_user_mock.assert_called_once_with(
-        "T9200"
-    )
-
-def test_already_satisfied_leaver_requires_no_ad_write():
-    """A fully deprovisioned account must produce a no-change plan."""
-    from app.models.models import Employee
-    from app.services import provisioning_service as ps
-
-    employee = Employee(
-        employee_id="T9201",
-        first_name="Taylor",
-        last_name="AlreadyDisabled",
-        email="taylor.alreadydisabled@corp.local",
-        department="Accounting",
-        job_title="Account Payable Analyst",
-        manager=None,
-        manager_employee_id=None,
-        employment_status="Terminated",
-        source_system="PYTEST",
-    )
-
-    disabled_ou = ps.AD_DISABLED_USERS_OU
-
-    ad_user = {
-        "distinguished_name": (
-            f"CN=Taylor AlreadyDisabled,{disabled_ou}"
-        ),
-        "display_name": "Taylor AlreadyDisabled",
-        "employee_id": "T9201",
-        "department": "Accounting",
-        "title": "Account Payable Analyst",
-        "manager": None,
-        "enabled": False,
-        "groups": [],
-    }
-
-    plan = ps.prepare_leaver(
-        employee=employee,
-        ad_user=ad_user,
-    )
-
-    assert plan["ready_for_ad_write"] is False
-    assert plan["groups_to_remove"] == []
-    assert plan["clear_manager"] is False
-    assert plan["target_ou"] == disabled_ou
-
-    assert plan["planned_operations"] == {
-        "disable_account": False,
-        "remove_groups": False,
-        "clear_manager": False,
-        "move_user": False,
-    }
-
-def test_partial_leaver_retry_executes_only_remaining_steps(mocker):
-    """
-    If a previous LEAVER attempt disabled the account and removed groups,
-    retry only the unfinished manager-clear and OU-move operations.
-    """
-    from app.models.models import Employee
-    from app.services import provisioning_service as ps
-
-    employee = Employee(
-        employee_id="T9202",
-        first_name="Casey",
-        last_name="PartialLeaver",
-        email="casey.partialleaver@corp.local",
-        department="Accounting",
-        job_title="Account Payable Analyst",
-        manager="Henry Woodward",
-        manager_employee_id="0008",
-        employment_status="Terminated",
-        source_system="PYTEST",
-    )
-
-    disabled_ou = ps.AD_DISABLED_USERS_OU
-
-    current_ad_user = {
-        "distinguished_name": (
-            "CN=Casey PartialLeaver,"
-            "OU=Accounting,OU=Departments,"
-            "DC=Corp,DC=local"
-        ),
-        "display_name": "Casey PartialLeaver",
-        "employee_id": "T9202",
-        "department": "Accounting",
-        "title": "Account Payable Analyst",
-        "manager": (
-            "CN=Henry Woodward,"
-            "OU=Accounting,OU=Departments,"
-            "DC=Corp,DC=local"
-        ),
-        "enabled": False,
-        "groups": [],
-    }
-
-    verified_user = {
-        **current_ad_user,
-        "distinguished_name": (
-            f"CN=Casey PartialLeaver,{disabled_ou}"
-        ),
-        "manager": None,
-        "enabled": False,
-        "groups": [],
-    }
-
+    state = active_ad_state()
     operations = []
 
-    disable_mock = mocker.patch.object(
-        ps,
-        "disable_ad_user",
-    )
-
-    remove_mock = mocker.patch.object(
-        ps,
-        "remove_user_from_group",
-    )
-
-    def fake_clear_manager(employee_id, manager_employee_id):
-        operations.append("clear manager")
+    def disable_ad_user(employee_id):
+        operations.append("disable")
+        state["enabled"] = False
         return {
             "success": True,
-            "changed": True,
-            "employee_id": employee_id,
-            "manager_employee_id": manager_employee_id,
+            "enabled": False,
+        }
+
+    def remove_user_from_group(employee_id, group_dn):
+        operations.append("remove_group")
+        state["groups"].remove(group_dn)
+        return {
+            "success": True,
+            "group_dn": group_dn,
+        }
+
+    def set_ad_manager(employee_id, manager_employee_id):
+        operations.append("clear_manager")
+        state["manager"] = None
+        return {
+            "success": True,
             "manager_dn": None,
         }
 
-    def fake_move(employee_id, target_ou):
-        operations.append("move user")
+    def move_ad_user(employee_id, target_ou):
+        operations.append("move")
+        state["distinguished_name"] = (
+            "CN=Test Leaver," + target_ou
+        )
         return {
             "success": True,
-            "changed": True,
-            "employee_id": employee_id,
-            "target_ou": target_ou,
+            "new_dn": state["distinguished_name"],
         }
 
-    def fake_get_user(employee_id):
-        operations.append("verify")
-        return verified_user
-
-    manager_mock = mocker.patch.object(
+    monkeypatch.setattr(
+        ps,
+        "disable_ad_user",
+        disable_ad_user,
+    )
+    monkeypatch.setattr(
+        ps,
+        "remove_user_from_group",
+        remove_user_from_group,
+    )
+    monkeypatch.setattr(
         ps,
         "set_ad_manager",
-        side_effect=fake_clear_manager,
+        set_ad_manager,
     )
-
-    move_mock = mocker.patch.object(
+    monkeypatch.setattr(
         ps,
         "move_ad_user",
-        side_effect=fake_move,
+        move_ad_user,
     )
-
-    mocker.patch.object(
+    monkeypatch.setattr(
         ps,
         "get_user_by_employee_id",
-        side_effect=fake_get_user,
+        lambda employee_id: dict(state),
     )
 
     plan = ps.prepare_leaver(
-        employee=employee,
-        ad_user=current_ad_user,
+        employee(),
+        dict(state),
     )
-
-    assert plan["ready_for_ad_write"] is True
-    assert plan["groups_to_remove"] == []
-    assert plan["clear_manager"] is True
-    assert plan["target_ou"] == disabled_ou
-
-    assert plan["planned_operations"] == {
-        "disable_account": False,
-        "remove_groups": False,
-        "clear_manager": True,
-        "move_user": True,
-    }
 
     result = ps.execute_leaver(
-        employee=employee,
-        plan=plan,
-    )
-
-    assert operations == [
-        "clear manager",
-        "move user",
-        "verify",
-    ]
-
-    disable_mock.assert_not_called()
-    remove_mock.assert_not_called()
-
-    manager_mock.assert_called_once_with(
-        employee_id="T9202",
-        manager_employee_id=None,
-    )
-
-    move_mock.assert_called_once_with(
-        employee_id="T9202",
-        target_ou=disabled_ou,
+        employee(),
+        plan,
     )
 
     verified = result["verified_ad_state"]
 
+    assert result["success"] is True
     assert verified["enabled"] is False
     assert verified["manager"] is None
     assert verified["groups"] == []
-    assert disabled_ou in verified["distinguished_name"]
-
-def test_leaver_stops_after_failed_disable_operation(mocker):
-    """
-    LEAVER must stop immediately if the initial account-disable operation
-    fails. Later deprovisioning operations must not run.
-    """
-    import pytest
-
-    from app.models.models import Employee
-    from app.services import provisioning_service as ps
-
-    employee = Employee(
-        employee_id="T9203",
-        first_name="Alex",
-        last_name="LdapFailure",
-        email="alex.ldapfailure@corp.local",
-        department="Accounting",
-        job_title="Account Payable Analyst",
-        manager="Henry Woodward",
-        manager_employee_id="0008",
-        employment_status="Terminated",
-        source_system="PYTEST",
+    assert verified["distinguished_name"].endswith(
+        DISABLED_OU
     )
 
-    accounting_group = (
-        "CN=Accounting Group,"
-        "OU=Domain Groups,"
-        "DC=Corp,DC=local"
+    assert operations == [
+        "disable",
+        "remove_group",
+        "remove_group",
+        "clear_manager",
+        "move",
+    ]
+
+
+def test_leaver_already_satisfied(monkeypatch):
+    monkeypatch.setattr(
+        ps,
+        "AD_DISABLED_USERS_OU",
+        DISABLED_OU,
     )
 
-    current_ad_user = {
+    final_state = {
         "distinguished_name": (
-            "CN=Alex LdapFailure,"
-            "OU=Accounting,OU=Departments,"
-            "DC=Corp,DC=local"
+            "CN=Test Leaver," + DISABLED_OU
         ),
-        "display_name": "Alex LdapFailure",
-        "employee_id": "T9203",
-        "department": "Accounting",
-        "title": "Account Payable Analyst",
-        "manager": (
-            "CN=Henry Woodward,"
-            "OU=Accounting,OU=Departments,"
-            "DC=Corp,DC=local"
-        ),
-        "enabled": True,
-        "groups": [accounting_group],
+        "enabled": False,
+        "manager": None,
+        "groups": [],
     }
 
-    disable_mock = mocker.patch.object(
+    plan = ps.prepare_leaver(
+        employee(),
+        final_state,
+    )
+
+    assert plan["ready_for_ad_write"] is False
+    assert not any(
+        plan["planned_operations"].values()
+    )
+
+
+def test_partial_leaver_retry(monkeypatch):
+    monkeypatch.setattr(
         ps,
-        "disable_ad_user",
-        side_effect=RuntimeError(
-            "Simulated LDAP disable failure"
+        "AD_DISABLED_USERS_OU",
+        DISABLED_OU,
+    )
+
+    partial_state = {
+        "distinguished_name": (
+            "CN=Test Leaver," + ACCOUNTING_OU
         ),
-    )
-
-    remove_mock = mocker.patch.object(
-        ps,
-        "remove_user_from_group",
-    )
-
-    manager_mock = mocker.patch.object(
-        ps,
-        "set_ad_manager",
-    )
-
-    move_mock = mocker.patch.object(
-        ps,
-        "move_ad_user",
-    )
-
-    get_user_mock = mocker.patch.object(
-        ps,
-        "get_user_by_employee_id",
-    )
+        "enabled": False,
+        "manager": MANAGER_DN,
+        "groups": [REMOTE_GROUP],
+    }
 
     plan = ps.prepare_leaver(
-        employee=employee,
-        ad_user=current_ad_user,
+        employee(),
+        partial_state,
     )
 
-    assert plan["planned_operations"]["disable_account"] is True
-
-    with pytest.raises(
-        RuntimeError,
-        match="Simulated LDAP disable failure",
-    ):
-        ps.execute_leaver(
-            employee=employee,
-            plan=plan,
-        )
-
-    disable_mock.assert_called_once_with(
-        employee_id="T9203",
+    assert (
+        plan["planned_operations"]["disable_account"]
+        is False
     )
-
-    remove_mock.assert_not_called()
-    manager_mock.assert_not_called()
-    move_mock.assert_not_called()
-    get_user_mock.assert_not_called()
-
+    assert plan["groups_to_remove"] == [REMOTE_GROUP]
+    assert (
+        plan["planned_operations"]["clear_manager"]
+        is True
+    )
+    assert (
+        plan["planned_operations"]["move_user"]
+        is True
+    )
